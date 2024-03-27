@@ -1,0 +1,379 @@
+---
+title: "Reference bias"
+output: 
+  github_document:
+    toc: true
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval=F, message=F, warning=F)
+```
+
+### load packages
+```{r eval=T}
+library(tidyverse)
+library(RcppCNPy)
+library(cowplot)
+library(ggstatsplot)
+library(statsExpressions)
+source("/workdir/genomic-data-analysis/scripts/individual_pca_functions.R")
+lg_filter <- read_csv('/workdir/smallmouth/sample_lists/lg_reference_annotate.csv')
+```
+
+Here, we examine the effect of reference bias by estimating Fst between two batches of data, and study the source of Fst outliers.
+
+See Nicholas' batch effect draft 
+file:///C:/Users/liam/Downloads/batch_effect_072221_no_field_code.pdf 
+
+and code 
+https://github.com/therkildsen-lab/batch-effect/blob/main/markdown/reference_bias.md
+
+### first, need to re-do some mapping with minmapq0
+The goal is to locate SNPs that have a high proportion of low-mapping-score reads mapping to them (e.g. >10%) in a batch of data with shorter reads, and exclude them from further analyses.
+
+```{bash eval=FALSE, include=TRUE}
+# First, re-run mapping with minmapq0 on a subset (excluding lane 3 and pop E/F)
+############# In the future, just need to do this with the degraded samples. I now have sample_table_merged_smb_anchored_AB.tsv, this is what I should have used from the start ###########################
+# I will use the adjusted low_coverage_mapping shell script, which skips mapping and just sorts
+# This will use the existing bam files generated from original mapping
+# It just uses samtools sort with minq0
+# [1] 4392 -->
+#[2] 4393 -->
+# [3] 4394 -->
+for k in {1,2,4}; do
+  nohup bash /workdir/smallmouth/scripts/low_coverage_mapping_refbias.sh \
+  '/workdir/smallmouth/sample_lists/reference_bias/sample_list_lane_'$k'_nextera.txt' \
+  '/workdir/smallmouth/sample_lists/reference_bias/sample_table_lane_'$k'.tsv' \
+  /workdir/smallmouth/adapter_clipped/ \
+  /workdir/smallmouth/ \
+  _adapter_clipped_f_paired.fastq.gz \
+  _adapter_clipped_r_paired.fastq.gz \
+  very-sensitive \
+  /workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta \
+  smb_anchored \
+  8 \
+  0 \
+  >& '/workdir/smallmouth/nohups/mapping_lane_'$k'_refbias2.nohup' &
+done
+```
+
+### Merge duplicated samples across lanes
+Should I have used the mincov_filtered here?
+
+```{r eval=FALSE, include=TRUE}
+library(tidyverse)
+
+## Define base directory and reference name
+basedir <- "/workdir/smallmouth/"
+refname <- "smb_anchored"
+
+## Read in unmerged sample tables
+for (i in c(1,2,4)){
+  sample_table <- read_tsv(paste0("../sample_lists/reference_bias/sample_table_lane_", i, ".tsv")) %>%
+    mutate(seq_id=as.character(seq_id), lane_number = as.character(lane_number), sample_seq_id=paste(sample_id,seq_id,lane_number, sep = "_"))
+  if (i == 1){
+    sample_table_final <- sample_table
+  } else {
+    sample_table_final <- bind_rows(sample_table_final, sample_table)
+  }
+}
+
+## Add a sample_id_corrected column, just in case that the same sample got assigned different IDs, or a few of the IDs are wrong
+# When this happends, just edit "wrong_id" and "correct_id"
+sample_table_final <- mutate(sample_table_final, sample_id_corrected=ifelse(sample_id!="wrong_id", sample_id, "correct_id"))
+
+## Create a merged table by keeping only one row for each unique sample
+# seq_id, lane_number, and data_type are all replaced with "merged" for duplicated samples
+sample_table_merged <- filter(sample_table_final, sample_id!="F3") %>%
+    group_by(sample_id_corrected) %>%
+  summarise(population=unique(population), seq_id=ifelse(n()==1,seq_id, "merged"), lane_number=ifelse(length(unique(lane_number))==1,unique(lane_number), "merged"), data_type=paste0(unique(data_type), collapse = "")) %>%
+  mutate(sample_seq_id=paste(sample_id_corrected, seq_id, lane_number, data_type, sep = "_")) %>%
+  select(sample_seq_id, lane_number, seq_id, sample_id_corrected, population, data_type)
+
+## Write the merged table
+write_tsv(sample_table_merged, "../sample_lists/reference_bias/sample_table_merged_smb_anchored.tsv")
+
+## Create bam lists as inputs for future steps
+bam_list_merged <- paste0(basedir, "bam/", sample_table_merged$sample_seq_id, "_bt2_", refname, "_minq0_sorted.bam")
+bam_list_dedup_overlapclipped <- transmute(sample_table_merged, suffix=ifelse(data_type=="se", paste0("_bt2_", refname, "_minq0_sorted_dedup.bam"), paste0("_bt2_", refname, "_minq0_sorted_dedup_overlapclipped.bam"))) %>%
+  .$suffix %>%
+  paste0(basedir, "bam/", sample_table_merged$sample_seq_id, .)
+bam_list_realigned <- transmute(sample_table_merged, suffix=ifelse(data_type=="se", paste0("_bt2_", refname, "_minq0_sorted_dedup_realigned.bam"), paste0("_bt2_", refname, "_minq0_sorted_dedup_overlapclipped_realigned.bam"))) %>%
+  .$suffix %>%
+  paste0(basedir, "bam/", sample_table_merged$sample_seq_id, .)
+write_lines(bam_list_merged, "../sample_lists/reference_bias/bam_list_merged_smb_anchored.txt")
+write_lines(bam_list_dedup_overlapclipped, "../sample_lists/reference_bias/bam_list_dedup_overlapclipped_smb_anchored.txt")
+write_lines(bam_list_realigned, "../sample_lists/reference_bias/bam_list_realigned_smb_anchored.txt")
+
+## Find all duplicated samples
+duplicated_samples <- (sample_table_final$sample_id_corrected)[duplicated(sample_table_final$sample_id_corrected)] %>% unique()
+duplicated_samples_seq_ids <- sample_table_merged[match(duplicated_samples,sample_table_merged$sample_id_corrected),] %>%
+  .$sample_seq_id
+merging_script<-NULL
+
+## Loop through all duplicated samples 
+for (i in 1:length(duplicated_samples)){
+  duplicated_sample <- duplicated_samples[i]
+  duplicated_samples_seq_id <- duplicated_samples_seq_ids[i]
+  ## Extract the bam file names from the unmerged sample table
+  input <- filter(sample_table_final, sample_id_corrected==duplicated_sample) %>%
+    mutate(unmerged_bam=paste(sample_id, seq_id, lane_number, data_type, "bt2", refname, "minq0_sorted.bam", sep = "_")) %>% 
+    # Note that sample_id is used in here instead of sample_id_corrected, since the unmerged bam file still uses sample_id as part of its name, not the corrected one.
+    .$unmerged_bam %>%
+    paste0(basedir, "bam/", .) %>%
+    paste(collapse = " ")
+  
+  ## Paste together the command line
+  merging_script[i] <- paste0("samtools merge ", basedir, "bam/", duplicated_samples_seq_id, "_bt2_", refname, "_minq0_sorted.bam ", input)
+}
+
+## Write the script
+write_lines(merging_script, "../scripts/merge_bam.sh")
+
+## Create bam list per pop for use as a future reference
+Honestly I just copy pasted from reference_bias/bam_list_realigned_smb_anchored.txt for both A and B
+```
+
+Keep going with bash script
+```{bash eval=FALSE, include=TRUE}
+# Run the merging script 54703
+nohup bash /workdir/smallmouth/scripts/merge_bam.sh > /workdir/smallmouth/nohups/merge_bam.nohup &
+
+# Deduplicate 42318
+nohup bash /workdir/data-processing/scripts/deduplicate_clipoverlap.sh \
+/workdir/smallmouth/sample_lists/reference_bias/bam_list_merged_smb_anchored.txt \
+/workdir/smallmouth/sample_lists/reference_bias/sample_table_merged_smb_anchored.tsv \
+> /workdir/smallmouth/nohups/deduplicate_clipoverlap_smb_anchored.nohup &
+
+# Realign around indels
+  # change name
+    cp /workdir/smallmouth/sample_lists/reference_bias/bam_list_dedup_overlapclipped_smb_anchored.txt \
+    /workdir/smallmouth/sample_lists/reference_bias/bam_list_dedup_overlapclipped_smb_anchored.list
+    
+  # run scipt - got rid of the step in the shell script to create new .intervals file, at Nicholas' suggestion. Can just reuse the one I have already for the global dataset 47556
+    cd /workdir/smallmouth/bam/
+  
+    nohup bash /workdir/smallmouth/scripts/realign_indels_refbias.sh \
+    /workdir/smallmouth/sample_lists/reference_bias/bam_list_dedup_overlapclipped_smb_anchored.list \
+    /workdir/smallmouth/ \
+    /workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta \
+    > /workdir/smallmouth/nohups/realign_indels.nohup &
+```
+
+    
+### Get snp depth in minmapq20 and minmapq0
+
+First just run the below script with minMapQ -0
+The only thing I'm worried about is that I didn't mincov filter this - hopefully this won't be an issue
+```{bash eval=FALSE, include=TRUE}
+nohup /workdir/programs/angsd0.931/angsd/angsd \
+-b /workdir/smallmouth/sample_lists/reference_bias/bam_list_per_pop/bam_list_realigned_AB.txt \
+-anc /workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta \
+-out /workdir/smallmouth/angsd/popminind20/bam_list_realigned_popsAB_minMapQ0 \
+-doCounts 1 -doDepth 1 -dumpCounts 1 \
+-P 16 -setMinDepth 20 -minInd 20 -minQ 20 \
+-minMapQ 0 \
+-sites /workdir/smallmouth/angsd/global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20.txt \
+-rf /workdir/smallmouth/angsd/global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20.chrs \
+>& /workdir/smallmouth/nohups/get_depth_anymapq.log &
+```
+
+Now,  change the -out and minMapQ to 20 in the above script and re-call 15394
+```{bash eval=FALSE, include=TRUE}
+nohup /workdir/programs/angsd0.931/angsd/angsd \
+-b /workdir/smallmouth/sample_lists/reference_bias/bam_list_per_pop/bam_list_realigned_AB.txt \
+-anc /workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta \
+-out /workdir/smallmouth/angsd/popminind20/bam_list_realigned_popsAB_minMapQ20 \
+-doCounts 1 -doDepth 1 -dumpCounts 1 \
+-P 16 -setMinDepth 20 -minInd 20 -minQ 20 \
+-minMapQ 20 \
+-sites /workdir/smallmouth/angsd/global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20.txt \
+-rf /workdir/smallmouth/angsd/global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20.chrs \
+>& /workdir/smallmouth/nohups/get_depth_minmapq20.log &
+```
+
+### Import the Fst measurements for each locus
+```{r eval=FALSE, include=TRUE}
+maf_B <- read_tsv("/workdir/smallmouth/angsd/popminind20/B_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.mafs.gz") %>%
+  transmute(chr = chromo, position = position, major_B=major, minor_B = minor, B_maf = knownEM, B_nind=nInd)
+  
+maf_C <- read_tsv("/workdir/smallmouth/angsd/popminind20/C_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.mafs.gz") %>%
+  transmute(chr = chromo, position = position, major_C=major, minor_C = minor, C_maf = knownEM, C_nind=nInd)
+ 
+# fst_B_C <- read_tsv("/workdir/smallmouth/angsd/popminind2/B_C_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind2.alpha_beta.txt", col_names = F) %>%
+#   mutate(X5=X3/X4) %>%
+#   transmute(lg=X1, position = X2, alpha=X3, beta=X4, fst = X5)
+
+fst_A_D <- read_tsv("/workdir/smallmouth/angsd/popminind20/A_D_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.alpha_beta.txt", col_names = F) %>%
+  mutate(X5=X3/X4) %>%
+  transmute(chr=X1, position = X2, alpha=X3, beta=X4, fst = X5)
+
+maf_joined <- inner_join(maf_B, maf_C, by = c('chr','position')) %>%
+  left_join(fst_A_D, by = c('chr', 'position')) %>% 
+  # filter(lg == 'NW_024040040.1_RagTag' | lg == 'NW_024040041.1_RagTag' | lg == 'NW_024040152.1_RagTag' | lg == 'NW_024040263.1_RagTag' | lg ==  'NW_024040374.1_RagTag'| lg == 'NW_024040485.1_RagTag'  | lg == 'NW_024040596.1_RagTag'  | lg == 'NW_024040707.1_RagTag' | lg == 'NW_024040817.1_RagTag' | lg == 'NW_024040928.1_RagTag' | lg == 'NW_024041039.1_RagTag' | lg == 'NW_024041150.1_RagTag' | lg == 'NW_024041151.1_RagTag' | lg == 'NW_024041262.1_RagTag' | lg == 'NW_024041373.1_RagTag' | lg == 'NW_024041484.1_RagTag' | lg == 'NW_024042261.1_RagTag' | lg == 'NW_024043372.1_RagTag' | lg == 'NW_024044237.1_RagTag' | lg == 'NW_024044348.1_RagTag' | lg == 'NW_024044459.1_RagTag' | lg == 'NW_024044570.1_RagTag' | lg == 'NW_024044681.1_RagTag') %>% 
+  #filter(se_nind>=20, pe_nind>=20) %>%
+  mutate(delta = abs(B_maf- C_maf)) %>%
+  arrange(desc(fst))
+
+# consolidate the unanchored chrs into one scaffold
+maf_joined_scaffolded<-maf_joined %>% 
+  left_join(lg_filter, by='chr') %>% 
+  filter(is.na(lg)) %>% 
+  arrange(chr, position) %>% 
+  mutate(pos_temp=as.double(row_number())) %>% 
+  dplyr::select(chr, position, pos_temp) %>% 
+  right_join(maf_joined, by=c('chr', 'position')) %>% 
+  mutate(pos_temp=if_else(is.na(pos_temp), position, pos_temp)) %>% 
+  left_join(lg_filter, by='chr') %>% 
+  mutate(name=if_else(is.na(name), 50, name))
+
+maf_joined_scaffolded %>%
+      filter(name==50) %>% 
+  ggplot(aes(x=position/10^6, y=fst)) +
+  geom_point(size = 0.2) +
+  #geom_smooth(aes(color=minor)) +
+  facet_grid(~name, scales = "free_x", space = "free_x") +
+  theme_cowplot() +
+  theme(panel.spacing = unit(0.0, "lines"))
+
+# Plot pre-depth_ratio filtering Fst on a moving 10kbp window
+  fixed_windowed_fst <- function(x, window_length){
+    mutate(x, position=cut(position, breaks=seq(0,50*10^6,window_length), labels=seq(window_length/2,50*10^6-window_length/2,window_length))) %>%
+    group_by(name, position) %>%
+    summarise(fst=sum(alpha)/sum(beta)) %>%
+    mutate(position=as.numeric(as.character(position)))
+  }
+  fixed_windowed_fst(maf_joined_scaffolded, 10000) %>%
+    ggplot(aes(x=position/10^6, y=fst)) +
+    geom_point(size = 0.2) +
+    facet_grid(~name, scales = "free_x", space = "free_x") +
+    theme_cowplot() +
+    theme(panel.spacing = unit(0.0, "lines"))
+```
+
+## Check depth_ratio, plot, then write new SNP list
+```{r eval=T, fig.width=15, fig.height=3}
+anymapq_depth <- read_tsv("/workdir/smallmouth/angsd/popminind20/bam_list_realigned_popsAB_minMapQ0.pos.gz") %>%
+  dplyr::rename(position=pos, total_depth_anymapq=totDepth)
+
+mapq20_depth <- read_tsv("/workdir/smallmouth/angsd/popminind20/bam_list_realigned_popsAB_minMapQ20.pos.gz") %>%
+  dplyr::rename(position=pos, total_depth_mapq20=totDepth)
+
+depth <- inner_join(anymapq_depth, mapq20_depth, by = c('chr', 'position')) %>%
+  mutate(depth_ratio=1-total_depth_mapq20/total_depth_anymapq)
+
+fst_cutoff <- 0.4
+
+# Make a plot showing Fst across read depth ratio
+fst_test<-maf_joined_scaffolded %>%
+    left_join(depth, by = c('chr', 'position')) 
+
+fst_test %>% 
+    ggplot(aes(x=depth_ratio, y=fst)) +
+    labs(x="proportion of reads that are below mapping quality score = 20", y="Fst") +
+    geom_point(size=0.2) +
+    geom_smooth(se=T) +
+    geom_hline(yintercept = fst_cutoff) + 
+    theme_cowplot()
+
+summary(lm(fst ~ depth_ratio, data = fst_test))
+
+# Here's the fancy one with the histogram above. doesn't work with fst_cutoff hline
+# p<-maf_joined %>%
+#     left_join(depth, by = c('lg', 'position')) %>%
+#     ggplot(aes(x=depth_ratio, y=fst)) +
+#     labs(x="proportion of reads that are below mapping quality score = 20", y="Fst") +
+#     geom_point(size=0.2) +
+#     geom_smooth(se=T) +
+#     theme_cowplot()
+#   ggExtra::ggMarginal(p, type = "histogram", size=5, margins="x", fill="white")
+  
+# Find a good Fst cutoff
+  cut_snps <- maf_joined_scaffolded %>%
+    left_join(depth, by = c('chr', 'position')) %>%
+    mutate(type = if_else(fst > fst_cutoff, 1, 0)) %>% 
+    group_by(type) %>% 
+    summarise(n = n())
+  fst_outlier_n <- cut_snps$n[2]
+  all_other_snp_n <- cut_snps$n[1]
+  
+# Apply this cutoff, do some stats, and plot where the depth ratio cutoffs should be 
+  maf_divided <- maf_joined %>%
+    mutate(type=ifelse(fst > fst_cutoff, paste0("Fst outliers\nn = ",fst_outlier_n), paste0("all other SNPs\nn= ",all_other_snp_n))) %>%
+    mutate(type=fct_relevel(type, c(paste0("Fst outliers\nn = ",fst_outlier_n), paste0("all other SNPs\nn= ",all_other_snp_n)))) %>%
+    left_join(depth) 
+  
+  maf_divided_stats <- statsExpressions::centrality_description(maf_divided, type, depth_ratio)
+    
+  maf_divided %>%
+  ggplot(aes(x=depth_ratio)) +
+  geom_density(mapping = aes(fill=type), alpha=0.3, adjust=1.8) +
+  geom_vline(data=maf_divided_stats, aes(xintercept = depth_ratio)) +
+  geom_label(data=maf_divided_stats, aes(label=expression), y=5, parse=TRUE) +
+  scale_fill_viridis_d() +
+  geom_vline(xintercept = 0.08, lty = 2) +
+  # labs(subtitle = two_sample_test(maf_divided, type, depth_ratio)$expression[[1]])
+  # labs(x="proportion of reads with mapping quality lower than 20",
+  #      y="density",
+  #      subtitle=expression(paste(italic("t")["Welch"], "(", "790.19", ") = ", "65.72", ", ", 
+  #                                italic("p"), " = ", "1.68e-322", ", ", widehat(italic("g"))["Hedges"], 
+  #                                " = ", "2.93", ", CI"["95%"], " [", "2.76", ", ", "3.10", 
+  #                                "], ", italic("n")["obs"], " = ", "1,732,738"))) +
+  #theme_ggstatsplot() +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line())
+
+  # to get the test stats that are commented out above
+#   maf_joined %>%
+#   mutate(type=ifelse(fst > 0.3, "Fst outliers", "all other SNPs")) %>%
+#   mutate(type=fct_relevel(type, c("Fst outliers", "all other SNPs"))) %>%
+#   left_join(depth) %>%
+#   ggbetweenstats(y=depth_ratio, x=type, output="subtitle", bf.message = FALSE)
+# stats_plot <- maf_joined %>%
+#   mutate(type=ifelse(fst > 0.3, "Fst outliers", "all other SNPs")) %>%
+#   mutate(type=fct_relevel(type, c("Fst outliers", "all other SNPs"))) %>%
+#   left_join(depth) %>%
+#   ggbetweenstats(y=depth_ratio, x=type, bf.message = FALSE, point.path = FALSE)
+# gginnards::delete_layers(stats_plot, "GeomPoint")
+  
+# Plot the per-SNP Fst
+  
+  # I am here. attach the pos_temp and name before plotting
+
+  maf_divided %>% 
+    left_join(lg_filter, by='chr') %>% 
+    mutate(name=if_else(is.na(name), 50, name)) %>% 
+    filter(depth_ratio < 0.08) %>% 
+    ggplot(aes(x=position/10^6, y=fst)) +
+    geom_point(size = 0.2) +
+    facet_grid(~name, scales = "free_x", space = "free_x") +
+    theme_cowplot() +
+    theme(panel.spacing = unit(0.0, "lines"))
+
+# Plot the window Fst
+  maf_joined %>%
+    left_join(lg_filter, by='chr') %>% 
+    mutate(name=if_else(is.na(name), 50, name)) %>% 
+  left_join(depth) %>%
+  filter(depth_ratio < 0.08) %>%
+  fixed_windowed_fst(10000) %>%
+  ggplot(aes(x=position/10^6, y=fst)) +
+  geom_point(size = 0.2) +
+  facet_grid(~name, scales = "free_x", space = "free_x") +
+  theme_cowplot() +
+  theme(panel.spacing = unit(0.0, "lines"))
+  
+# Write the depth_ratio filtered SNP list
+  depth_ratio_filtered <- maf_joined %>%
+    left_join(depth, by = c('chr', 'position')) %>% 
+    filter(depth_ratio <0.08) %>% 
+    select(c('chr','position'))
+  
+  original_snp_list <- read_tsv("/workdir/smallmouth/angsd/global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20.txt", col_names = c("chr", "position", "major", "minor")) 
+  
+  depth_filtered <- left_join(depth_ratio_filtered, original_snp_list) %>% 
+    arrange(chr, position)
+  
+  write_tsv(depth_filtered, "/workdir/smallmouth/angsd/global_snp_list_depth_ratio_filtered.txt", col_names = F)
+```

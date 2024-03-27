@@ -1,0 +1,1136 @@
+---
+title: "Genome Assembly"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## File load
+
+```{r}
+library(tidyverse)
+lg_filter<-read_csv('/workdir/smallmouth/sample_lists/lg_reference_annotate.csv')
+```
+
+## Nanopore file management 
+
+basecalling is much faster with GPU - files saved to /workdir/smallmouth/npore/fastq/pass
+
+A nice explanation of all flags is on the ONT website (requires login)
+https://community.nanoporetech.com/protocols/Guppy-protocol/v/gpb_2003_v1_revt_14dec2018/setting-up-a-run-configurations-and-parameters
+
+--recursive will go through all subdirectories in the listed directory in search of fast5 files (not used in below example)
+--num_callers is the number of cores to use, make sure to double-check with htop
+
+```{bash eval=FALSE, include=TRUE}
+nohup /programs/ont-guppy-cpu/bin/guppy_basecaller  \
+--input_path /workdir/smallmouth/npore/fast5/ \
+--save_path /workdir/smallmouth/npore/fastq/ \
+--num_callers 10 \
+-q 0 \
+--cpu_threads_per_caller 1 \
+--flowcell FLO-MIN106 \
+--kit SQK-LSK109 \
+--qscore_filtering \
+--min_qscore=7 \
+> /workdir/smallmouth/nohups/guppy.nohup &
+```
+
+
+combine all fastq files into one file 50455
+
+```{bash eval=FALSE, include=TRUE}
+nohup cat *.fastq > npore_F2_F3.fastq &
+nohup gzip npore_F2_F3.fastq &
+```
+
+count fastq bp 52551
+File is too big for fastqc. 13gb is a lot of data! npore bp is 8.11x coverage
+
+```{bash eval=FALSE, include=TRUE}
+nohup cat npore_F2_F3.fastq | awk 'NR%4==2' | tr -d "\n" | wc -m > npore_bp_count.nohup & 
+```
+
+To check how big the F2 & F3 contributions are, copy and paste the text file in nanopore, drop into excel as tab-delimited
+
+## Hiseq: combine demultiplexed and adapter clipped files from three different lanes into a single file, for R1 and R2
+when concatenating gzipped files, just make sure that the output is specific as .gz and all should be well
+Use cat, not zcat, because cat will produced zipped files and zcat will produce unzipped files
+
+```{bash eval=FALSE, include=TRUE}
+cd /workdir/smallmouth/adapter_clipped/
+nohup cat *TCCGCGAA_TCAGAGCC*_r_paired* > HiSeq_F3_ForMasurca_r_paired.fastq.gz &
+nohup cat *TCCGCGAA_TCAGAGCC*_f_paired* > HiSeq_F3_ForMasurca_f_paired.fastq.gz &
+```
+
+## Login on Xsede server on command line
+$ is used before any variable ... XSEDE sets HOME and SCRATCH automatically
+
+```{bash eval=FALSE, include=TRUE}
+ssh genomebr@login.xsede.org # this gets me into login node. password is BassAttack73!
+gsissh bridges2
+quota # check how much time is left
+projects # check what projects I have running & lists charge ID (mcz3a6p)
+cd $PROJECT
+```
+ 
+## Install lastest version of MaSuRCA (run on XSEDE)
+rm -r masurca, then git clone
+I can start with tring to install the most recent version, but if it throws an error, move sequentially backwards
+
+```{bash eval=FALSE, include=TRUE}
+cd $SCRATCH
+git clone https://github.com/alekseyzimin/masurca.git
+cd masurca/
+tar xzf MaSuRCA-3.4.0.tar.gz
+cd MaSuRCA-3.4.0
+bash install.sh
+```
+
+## Transfer fastq and nanopore files from lab server to Xsede
+/pylon5/xxx is charge ID, which can be found by writing [projects]  
+
+```{bash eval=FALSE, include=TRUE}
+# Do this in XSEDE
+
+cd $SCRATCH
+mkdir smallmouth
+cd smallmouth
+mkdir adapter_clipped
+mkdir nanopore
+mkdir reference
+mkdir genome
+# get rid of the old genome assembly if it is still there, or rename it
+
+# Do this from lab server
+
+scp -P 2222 /workdir/smallmouth/adapter_clipped/HiSeq_F3_ForMasurca* genomebr@data.bridges2.psc.edu:/ocean/projects/mcb200006p/genomebr/smallmouth/adapter_clipped/
+
+scp -P 2222 /workdir/smallmouth/npore/fastq/pass/npore_F2_F3.fastq.gz genomebr@data.bridges2.psc.edu:/ocean/projects/mcb200006p/genomebr/smallmouth/nanopore/
+
+scp -P 2222 /workdir/smallmouth/genome/lmb_genome_chrs.fna genomebr@data.bridges2.psc.edu:/ocean/projects/mcb200006p/genomebr/smallmouth/reference/
+```
+
+## Edit MaSuRCA configuration (sr_config) file (run the chunk right here)
+this creates assemble.sh saved into ../smallmouth/genome
+
+If running on lab server instead of XSEDE: navigate to the ../genome, run: 
+/workdir/programs/masurca/MaSuRCA-3.3.5/bin/masurca sr_config.txt 
+
+```{r eval=FALSE, include=TRUE}
+library(tidyverse)
+sr_config <-
+"DATA
+#Illumina paired end reads supplied as <two-character prefix> <fragment mean> <fragment stdev> <forward_reads> <reverse_reads> if single-end, do not specify <reverse_reads>
+PE= pe 583 87 /ocean/projects/mcb200006p/genomebr/smallmouth/adapter_clipped/HiSeq_F3_ForMasurca_f_paired.fastq.gz /ocean/projects/mcb200006p/genomebr/smallmouth/adapter_clipped/HiSeq_F3_ForMasurca_r_paired.fastq.gz
+
+#PE= pe 583 87 /workdir/smallmouth/adapter_clipped/HiSeq_F3_ForMasurca_f_paired.fastq.gz /workdir/smallmouth/adapter_clipped/HiSeq_F3_ForMasurca_r_paired.fastq.gz
+
+#pacbio OR nanopore reads must be in a single fasta or fastq file with absolute path, can be gzipped
+#NANOPORE=/ocean/projects/mcb200006p/genomebr/smallmouth/nanopore/npore_F2_F3.fastq.gz
+
+#synteny-assisted assembly, concatenate all reference genomes into one reference.fa; works for Illumina-only data
+REFERENCE=/ocean/projects/mcb200006p/genomebr/smallmouth/reference/lmb_genome_chrs.fna
+#REFERENCE=/workdir/smallmouth/genome/lmb_genome_chrs.fna
+
+END
+
+PARAMETERS
+
+EXTEND_JUMP_READS=0
+GRAPH_KMER_SIZE = auto
+
+#set this to 1 for all Illumina-only assemblies, 0 if you have more than 15x coverage by long reads 
+USE_LINKING_MATES = 1
+
+USE_GRID=0
+GRID_ENGINE=SGE
+GRID_QUEUE=all.q
+GRID_BATCH_SIZE=500000000
+LHE_COVERAGE=35
+MEGA_READS_ONE_PASS=0
+LIMIT_JUMP_COVERAGE = 300
+CLOSE_GAPS=0
+
+#number of cpus to use, set this to the number of CPUs/threads per node you will be using
+NUM_THREADS = 96
+
+#this is mandatory jellyfish hash size -- a safe value is estimated_genome_size*20
+JF_SIZE = 16520000000
+
+# set to 1 if have large genome, larger than 8gbp
+SOAP_ASSEMBLY=0
+
+# Set to 1 if doing hybrid assembly with greater than 15x long read coverage
+FLYE_ASSEMBLY=0
+
+END"
+
+write_lines(sr_config, "../genome/sr_config.txt")
+```
+
+## Generate assemble.job to be submitted on XSEDE (run it right here)
+
+-N is number of nodes (use 1)
+-n is number of cores (using 32)
+-p is partition, using EM
+
+```{r eval=FALSE, include=TRUE}
+library(tidyverse)
+assemble<-"#!/bin/bash
+#SBATCH -N 1
+#SBATCH -n 96
+#SBATCH -p EM
+#SBATCH -t 100:00:00
+
+# echo commands to stdout 
+set -x
+
+cd /ocean/projects/mcb200006p/genomebr/smallmouth/genome_smb_synteny
+
+bash assemble.sh
+
+# sbatch -N 1 -n 96 -p EM -t 100:00:00 assemble.job"
+write_lines(assemble, "../genome/assemble.job")
+```
+
+## Transfer assemble.job and sr_config.txt to XSEDE (run on lab server)
+
+sr_config.txt
+```{bash eval=FALSE, include=TRUE}
+scp -P 2222 /workdir/smallmouth/genome/sr_config.txt genomebr@data.bridges2.psc.edu:/ocean/projects/mcb200006p/genomebr/smallmouth/genome_smb_synteny/
+```
+
+assemble.job
+```{bash eval=FALSE, include=TRUE}
+scp -P 2222 /workdir/smallmouth/genome/assemble.job genomebr@data.bridges2.psc.edu:/ocean/projects/mcb200006p/genomebr/smallmouth/genome_smb_synteny/
+```
+
+## Generate assemble.sh (run on XSEDE server)
+
+```{bash eval=FALSE, include=TRUE}
+gsissh bridges2
+cd $PROJECT
+cd genome_smb_synteny
+
+/ocean/projects/mcb200006p/genomebr/masurca/MaSuRCA-3.4.0/bin/masurca \
+/ocean/projects/mcb200006p/genomebr/smallmouth/genome_smb_synteny/sr_config.txt
+```
+
+## Submit assemble.job on XSEDE (run on XSEDE server)
+
+```{bash eval=FALSE, include=TRUE}
+sbatch -N 1 -n 96 -p EM -t 100:00:00 /ocean/projects/mcb200006p/genomebr/smallmouth/genome_smb_synteny/assemble.job
+```
+
+
+## XSEDE commands
+These are all used to check status of jobs
+-u is username
+-j is job ID
+
+```{bash eval=FALSE, include=TRUE}
+squeue -u genomebr # status & time used
+sacct -X -j 12646273  # more info
+srun --jobid=12646273 top -b -n 1 | grep genomebr # important to check in on job
+sstat -j 12646273.batch --format=JobID,MaxRss # important to check in on job
+scancel JOBID # this is just if it gets caught up, don't use otherwise
+du -sh
+```
+
+## Transfer the assembly result back (do this from lab server)
+
+```{bash eval=FALSE, include=TRUE}
+sftp -P 2222 genomebr@data.bridges2.psc.edu
+
+# use password & duo to login
+
+get /ocean/projects/mcb200006p/genomebr/smallmouth/genome_smb_synteny_noscaffolds.fasta /workdir/smallmouth/genome/smb_synteny.scf.fasta
+
+# The below is to transfer back my demultiplexed references, so I can adapter clip
+
+get /ocean/projects/mcb200006p/genomebr/smallmouth/adapter_clipped/HiSeq_F3_ForMasurca_r_paired.fastq.gz /workdir/smallmouth/adapter_clipped/HiSeq_F3_ForMasurca_r_paired.fastq.gz
+
+get /ocean/projects/mcb200006p/genomebr/smallmouth/adapter_clipped/HiSeq_F3_ForMasurca_f_paired.fastq.gz /workdir/smallmouth/adapter_clipped/HiSeq_F3_ForMasurca_f_paired.fastq.gz
+```
+
+## Chromosome anchoring
+
+### Generate dotplot
+Find the reference genome we want to anchor to
+If it is on NCBI, make sure to choose RefSeq (if there is annotation data in .gff file format)
+  GenBank data is user-uploaded and will not have all the annotation information
+Upload genome to CoGe
+Upload the reference genome to CoGe
+Generate the dotplot using SynMap (spp 1 is y-axis, spp 2 is x-axis)
+
+### Use Ragtag on the chosen reference genome to anchor
+Scaffolding (took 5 minutes)
+```{bash eval=FALSE, include=TRUE}
+source /programs/miniconda3/bin/activate ragtag
+cd /workdir/smallmouth/genome
+nohup ragtag.py scaffold lmb_genome_ncbi.fna smb_50x.scf.fasta &
+```
+
+Patch N's using LMB genome (took several hours)
+```{bash eval=FALSE, include=TRUE}
+source /programs/miniconda3/bin/activate ragtag
+cd /workdir/smallmouth/genome
+nohup ragtag.py patch ragtag_output/ragtag.scaffold.fasta lmb_genome_ncbi.fna -o ./ragtag_output_patched &
+```
+
+### Subset the anchored chromosome and filter to just get long sequences
+
+**************************************************
+In the future, I should rename the chromosomes something easy, like including 'lg' in them, so I can pull them out later
+It is still important to inclue the short fragments, but it will make my life easier down the line to rename the chromosomes
+**************************************************
+
+
+subset the genome and make an index file
+```{bash eval=FALSE, include=TRUE}
+cd /workdir/smallmouth/genome/smb_anchored/
+
+# Set path to use bioawk
+export PATH=/programs/bioawk:$PATH
+
+# subset to get just sequences longer than 500kb and make a new chrs file
+bioawk -c fastx '{ if(length($seq) > 500000) { print ">"$name; print $seq }}' smb_anchored.fasta > smb_anchored_chrs.fasta
+
+# Index it and create fai file
+# Info on fai file https://www.htslib.org/doc/faidx.html
+# tab-delimited file, with (1)sequence_name (2)length(bp) (3)location (4th/5th columns I don't understand)
+
+samtools faidx smb_anchored_chrs.fasta
+
+```
+
+read the index file to see how long sequences are
+```{r eval=TRUE, message=FALSE, warning=FALSE, include=TRUE}
+library(tidyverse) # I'll need this
+
+fai <- read_tsv('/workdir/smallmouth/genome/smb_anchored/smb_anchored_chrs.fasta.fai',
+                col_names = c('sequence', 'length', 'location')) # Read in data
+
+fai_lg <- tibble(lg = 1:length(fai$sequence)) # Make the tibble of linkage groups
+
+fai <- bind_cols(fai, fai_lg) # bind these babies
+
+fai %>% 
+  ggplot(aes(lg, length)) +
+    geom_point() +
+    geom_line() +
+    ggtitle('each chromosome is ~20-55 billion base pairs') # Make a ggplot of the length of each chromosome
+
+print(fai$sequence) # Finally, make a text string that I can use to filter these linkage groups in the future
+
+# And just manually change it. single apostrophe requred ', not the double "
+lg == 'NW_024040040.1_RagTag' | lg == 'NW_024040041.1_RagTag' | lg == 'NW_024040152.1_RagTag' | lg == 'NW_024040263.1_RagTag' | lg ==  'NW_024040374.1_RagTag'| lg == 'NW_024040485.1_RagTag'  | lg == 'NW_024040596.1_RagTag'  | lg == 'NW_024040707.1_RagTag' | lg == 'NW_024040817.1_RagTag' | lg == 'NW_024040928.1_RagTag' | lg == 'NW_024041039.1_RagTag' | lg == 'NW_024041150.1_RagTag' | lg == 'NW_024041151.1_RagTag' | lg == 'NW_024041262.1_RagTag' | lg == 'NW_024041373.1_RagTag' | lg == 'NW_024041484.1_RagTag' | lg == 'NW_024042261.1_RagTag' | lg == 'NW_024043372.1_RagTag' | lg == 'NW_024044237.1_RagTag' | lg == 'NW_024044348.1_RagTag' | lg == 'NW_024044459.1_RagTag' | lg == 'NW_024044570.1_RagTag' | lg == 'NW_024044681.1_RagTag'
+
+```
+
+### Depracated code - medusa, dotplot, coords file. May still be some useful stuff in here
+
+#### Medusa
+
+This uses medusa - make sure the reference genome is in the reference folder
+NO OTHER FILES CAN BE IN THAT FOLDER BESIDES REFERENCE GENOMES
+
+Medusa only works to the .delta and .coords file - need to have networkx installed and it crashed
+
+if it crashes: new commit pushed to main branch
+https://github.com/combogenomics/medusa/pull/32
+
+```{bash eval=FALSE, include=TRUE}
+cd /workdir/smallmouth
+cp -r /programs/medusa-1.6/ ./
+
+export PYTHONPATH=/workdir/smallmouth/medusa-1.6/lib/python3.6/site-packages
+cd /workdir/smallmouth/medusa-1.6
+
+# Run it 
+nohup java -jar medusa.jar -f /workdir/smallmouth/genome/lmb_gen -i /workdir/smallmouth/genome/smb_50x.scf.fasta -v &
+
+# Reference genome will be made in the medusa folder. Use -o to specify the file name
+
+# Mummer plot on the coords and delta file
+
+nohup /programs/mummer-4.0.0rc1/bin/mummerplot /workdir/smallmouth/genome/medusa_output/smb_50x_GCF_014851395.delta &
+
+# See this exercise for how to work with delta outputs
+# https://github.com/tpoorten/dotPlotly/tree/master/example
+
+delta-filter -r smb_50x_GCF_014851395.delta > smb_50x_GCF_014851395.delta.filter
+
+show-coords smb_50x_GCF_014851395.delta.filter > smb_50x_GCF_014851395.delta.filter.coords
+
+#dnadiff -d smb_50x_GCF_014851395.delta -p smb_50x
+
+/workdir/smallmouth/bin/dotPlotly/mummerCoordsDotPlotly.R -i smb_50x_GCF_014851395.delta.filter.coords -o smb_50x_GCF_014851395.nucmer.plot -m 1000 -q 300000 -k 10 -s -t -l -p 12
+
+# Just get headers
+
+grep -e ">" /workdir/smallmouth/genome/lmb_genome_ncbi.fna > lmb_genome_ncbi_headers.txt
+
+zgrep -e ">" /workdir/smallmouth/genome/lmb_genome_china.gz > lmb_genome_china_headers.txt
+
+
+```
+
+#### Work with the coords file
+
+See mummer github for delta file headers
+
+```{r eval=TRUE, message=FALSE, warning=FALSE, include=TRUE}
+
+# Testing syntenic assembly - this has all contigs ordered! Now if I can just place them on chromosome...
+fai_synteny <- read_tsv("../genome/smb_synteny.scf.fasta.fai", col_names = c('REF_ID', 'contig_length', 'contig_start_position', NA, NA))
+
+
+# Getting chromosome numbers to contigs from fna.fai file
+fai <- read_tsv("../genome/lmb_genome_ncbi.fna.fai", col_names = c('REF_ID', 'chr_length', 'chr_start_position', NA, NA)) %>%
+  select(-c(X4, X5)) %>%
+  filter(chr_length > 500000) %>%
+  mutate(chr = paste0('LG', c(01:23)))
+
+# Import alignment
+align <- read_delim("../genome/medusa_output/smb_50x_GCF_014851395.coords", skip = 5, delim= " ",col_names = c('S_Q', 'E_Q', NA, 'S_R', 'E_R', NA, 'LEN_1', 'LEN_2', NA, 'PERC_IDY', NA, 'LEN_Q', 'LEN_R', NA, 'COV_Q', 'COV_R', NA, 'TAGS')) %>%
+  select(-c(X3, X6, X9, X11, X14, X17)) %>%
+  mutate(PERC_IDY = round(as.numeric(PERC_IDY),0)) %>%
+  mutate(LEN_Q = as.integer(LEN_Q)) %>%
+  mutate(LEN_1 = as.integer(LEN_1)) %>%
+  mutate(LEN_2 = as.integer(LEN_2)) %>%
+  mutate(LEN_Q = as.integer(LEN_Q)) %>%
+  separate(TAGS, c('QUE_ID', 'REF_ID'), sep = '\t') 
+
+# Bind chromosomes to alignment and filter out the reference contigs that aren't chrs
+align <- inner_join(align, fai, by = 'REF_ID') %>%
+  mutate(QUE_ID_CHR = paste0(QUE_ID,'_',as.character(chr)))
+
+# Assess coverage success of different parameters
+# ONCE I HEAR BACK FROM THE AUTHORS, EXCHANGE THE LOCATION FOR CHROMOSOME!
+out <- tibble()
+for(i in c(1000, 5000, 10000)) { 
+  for(j in c(100, 1000, 5000)) { 
+    for(k in c(90, 95, 98)) {
+      align_filt <- align %>%
+        filter(PERC_IDY > k) %>% # Set a 95% minimum mapping identity
+        #filter(LEN_2 > min(LEN_Q)) %>% # remove mapped regions that are smaller than min contig size
+        filter(LEN_Q > i) %>% # Set minimum query contig length 
+        filter(LEN_2 > j) %>% # Set minimum mapped length
+        group_by(QUE_ID, chr.y) %>% # Below here, select only the contigs that map to 1 location
+        summarise(n = n()) %>%
+        ungroup() %>%
+        group_by(QUE_ID) %>%
+        summarise(n = n()) %>%
+        filter(n == 1) 
+      
+      align_filt_out <- inner_join(align, align_filt, by = 'QUE_ID') %>%
+        filter(PERC_IDY > k) %>% 
+        filter(LEN_Q > i) %>% 
+        filter(LEN_2 > j) %>% 
+        group_by(QUE_ID_CHR) %>%
+        summarise(LEN_Q_MEAN = mean(LEN_Q))
+      
+      coverage <- sum(align_filt_out$LEN_Q_MEAN)/826000000 # How much of the genome does it cover?
+      
+      values <- tibble(LEN_Q = i, LEN_2 = j, IDY = k, COV = coverage)
+      out <- bind_rows(values, out)
+    }
+  }
+}
+
+# Here, use the best mapping success to anchor contigs to chr
+
+align_filt <- align %>%
+  filter(PERC_IDY > 90) %>%
+  filter(LEN_Q > 5000) %>%
+  filter(LEN_2 > 5000) %>%
+  group_by(QUE_ID, chr) %>%
+  summarise(n = n()) %>%
+  ungroup() %>%
+  group_by(QUE_ID) %>%
+  summarise(n = n()) %>%
+  filter(n == 1) 
+
+align_filt_out <- inner_join(align, align_filt, by = 'QUE_ID') %>%
+  filter(PERC_IDY >90) %>% 
+  filter(LEN_Q > 5000) %>% 
+  filter(LEN_2 > 5000) %>% 
+  group_by(QUE_ID, chr) %>%
+  summarise(n = n(),
+            LEN_Q_MEAN = mean(LEN_Q))
+
+sum(align_filt_out$LEN_Q_MEAN)/826000000
+
+write_tsv(align_filt_out, '/workdir/smallmouth/genome/smb_50x_anchored.tsv')
+
+```
+
+
+## QUAST 40124
+This assesses the quality of genome assembly, and results end up in genome_quast
+
+```{bash eval=FALSE, include=TRUE}
+nohup /programs/quast-5.1.0rc1/quast.py \
+/workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta -o /workdir/smallmouth/genome/smb_anchored/smb_anchored_quast \
+> /workdir/smallmouth/nohups/quast.nohup &
+```
+## BUSCO  47199
+smb_anchored 97%, smb_50x 
+```{bash eval=FALSE, include=TRUE}
+# Make sure to delete any folder in the BUSCO directory that was creatd with the same genome name (smb_50x)
+cd /workdir/smallmouth/BUSCO/
+
+source /programs/miniconda3/bin/activate busco-5.2.2
+
+nohup busco -i /workdir/smallmouth/genome/old_genomes/smb_50x/smb_50x.scf.fasta -l actinopterygii_odb10 -o smb_50x -m genome &
+```
+
+## Upload to NCBI 
+
+first, we need to filter out fragments that are shorter than 200bp
+```{bash eval=FALSE, include=TRUE}
+cd /workdir/smallmouth/genome/smb_anchored
+
+# Set path so we can use bioawk
+export PATH=/programs/bioawk:$PATH
+
+# Examine sequence length distribution
+bioawk -c fastx '{print ">" $name ORS length($seq)}' smb_anchored_200bp.fasta > sequencelengthdist.txt
+
+# Exclude sequences that are less than 200bp
+nohup bioawk -c fastx '{ if(length($seq) > 200) { print ">"$name; print $seq }}' smb_anchored.fasta > smb_anchored_200bp.fasta &
+
+# Make new directory and move filtered fasta to it
+mkdir NCBIupload
+mv smb_anchored_200bp.fasta NCBIupload/
+
+```
+
+Examine sequence length before and after
+```{r eval=FALSE}
+library(tidyverse)
+
+# At first, we have many sequences that are less than 200bp
+read_csv('/workdir/smallmouth/genome/smb_anchored/sequencelengthdist.txt', col_names = 'len') %>% 
+  filter(!str_detect(len, '>')) %>% 
+  mutate(len = as.integer(len)) %>% 
+  filter(len < 200)
+
+```
+
+*Next, we need to filter out the adapter sequences that made it into the assembly*
+Heres a good tutorial for searching for a sequence https://www.biostars.org/p/125610/
+
+NCBI detected three adapter sequences 
+NGB01096.1 = ThruPLEX DNA-seq dual-index D508 (GTACTGAC) we used the reverse complement of this as D508
+NGB01069.1 = iPCRtagT41 (TCCAGTCG) we didn't use this
+NGB00750.1 = Illumina TruSeq DNA HT and RNA HT i5 index D504 adapter(GGCTCTGA) we used the reverse complement (TCAGAGCC)
+
+Subset regions here to take a look at what was causing the issue
+```{bash eval=FALSE, include=TRUE}
+# Set path
+export PATH=/programs/bioawk:$PATH
+
+# First subset each of the problem regions
+scf7180002177923	
+
+# Search for a particular sequence
+bioawk -c fastx '$seq ~ /ACCGTACCC/ { print ">"$name"\n"$seq; }'
+
+# Search for a particular contig
+bioawk -c fastx '$name ~ /scf7180002177923/ { print ">"$name"\n"$seq; }' /workdir/smallmouth/genome/smb_anchored/NCBIupload/smb_anchored_noMtDNA.fasta
+```
+
+Convert sequence to N and trim, if at the end of contig
+```{bash eval=FALSE, include=TRUE}
+# The below if from the NCBI contamination report
+Trim:
+Sequence name, length, span(s), apparent source
+NW_024040374.1_RagTag	33637847	18567836..18567855	adaptor:NGB01096.1
+NW_024040596.1_RagTag	32282073	6590116..6590138	adaptor:NGB01096.1
+NW_024040707.1_RagTag	32915680	11164073..11164091,13693905..13693955	adaptor:multiple
+NW_024040928.1_RagTag	29824044	22427678..22427696	adaptor:NGB01096.1
+NW_024041150.1_RagTag	39324673	25539541..25539561	adaptor:NGB01096.1
+NW_024044681.1_RagTag	36128779	10809862..10809898	adaptor:NGB01069.1
+scf7180002177923	303	1..29	adaptor:NGB00750.1
+scf7180002178998	1810	1791..1810	adaptor:NGB01096.1
+scf7180002183650	430	1..48	adaptor:multiple
+scf7180002185787	305	269..305	adaptor:multiple
+scf7180002185858	302	253..302	adaptor:multiple
+scf7180002185897	300	260..300	adaptor:multiple
+
+# delete sequence -d [start position]:[end position] -s [contig]
+# Need to create a new fasta each time
+/programs/seqkit-0.15.0/seqkit mutate -d 1:29 -s scf7180002177923 smb_anchored_200bp.fasta > test1.fasta
+/programs/seqkit-0.15.0/seqkit mutate -d 1791:1810 -s scf7180002178998 test1.fasta > test2.fasta
+/programs/seqkit-0.15.0/seqkit mutate -d 1:48 -s scf7180002183650 test2.fasta > test3.fasta
+/programs/seqkit-0.15.0/seqkit mutate -d 269:305 -s scf7180002185787 test3.fasta > test4.fasta
+/programs/seqkit-0.15.0/seqkit mutate -d 253:302 -s scf7180002185858 test4.fasta > test5.fasta
+/programs/seqkit-0.15.0/seqkit mutate -d 260:300 -s scf7180002185897 test5.fasta > test6.fasta
+
+# Using mutate to change sequence to N. -p [position]:[what to change base to] -s [contig] 
+# I am here, got this error [ERRO] fastx: stdin not detected
+/programs/seqkit-0.15.0/seqkit mutate -p 18567836:N -p 18567837:N -p 18567838:N -p 18567839:N -p 18567840:N -p 18567841:N -p 18567842:N -p 18567843:N -p 18567844:N -p 18567845:N -p 18567846:N -p 18567847:N -p 18567848:N -p 18567849:N -p 18567850:N -p 18567851:N -p 18567852:N -p 18567853:N -p 18567854:N -s NW_024040374.1_RagTag test6.fasta > test7.fasta
+
+/programs/seqkit-0.15.0/seqkit mutate -p 6590116:N -p 6590117:N -p 6590118:N -p 6590119:N -p 6590120:N -p 6590121:N -p 6590122:N -p 6590123:N -p 6590124:N -p 6590125:N -p 6590126:N -p 6590127:N -p 6590128:N -p 6590129:N -p 6590130:N -p 6590131:N -p 6590132:N -p 6590133:N -p 6590134:N -p 6590135:N -p 6590136:N -p 6590137:N -p 6590138:N -s NW_024040596.1_RagTag test7.fasta > test8.fasta
+
+/programs/seqkit-0.15.0/seqkit mutate -p 11164073:N -p  11164074:N -p 11164075:N -p 11164076:N -p 11164077:N -p 11164078:N -p 11164079:N -p 11164080:N -p 11164081:N -p 11164082:N -p 11164083:N -p 11164084:N -p 11164085:N -p 11164086:N -p 11164087:N -p 11164088:N -p 11164089:N -p 11164090:N -p 11164091:N -p 13693905:N -p 13693906:N -p 13693907:N -p 13693908:N -p 13693909:N -p 13693910:N -p 13693911:N -p 13693912:N -p 13693913:N -p 13693914:N -p 13693915:N -p 13693916:N -p 13693917:N -p 13693918:N -p 13693919:N -p 13693920:N -p 13693921:N -p 13693922:N -p 13693923:N -p 13693924:N -p 13693925:N -p 13693926:N -p 13693927:N -p 13693928:N -p 13693929:N -p 13693930:N -p 13693931:N -p 13693932:N -p 13693933:N -p 13693934:N -p 13693935:N -p 13693936:N -p 13693937:N -p 13693938:N -p 13693939:N -p 13693940:N -p 13693941:N -p 13693942:N -p 13693943:N -p 13693944:N -p 13693945:N -p 13693946:N -p 13693947:N -p 13693948:N -p 13693949:N -p 13693950:N -p 13693951:N -p 13693952:N -p 13693953:N -p 13693954:N -p 13693955:N -s NW_024040707.1_RagTag test8.fasta > test9.fasta
+
+/programs/seqkit-0.15.0/seqkit mutate -p 22427678:N -p 22427679:N -p 22427680:N -p 22427681:N -p 22427682:N -p 22427683:N -p 22427684:N -p 22427685:N -p 22427686:N -p 22427687:N -p 22427688:N -p 22427689:N -p 22427690:N -p 22427691:N -p 22427692:N -p 22427693:N -p 22427694:N -p 22427695:N -p 22427696:N -s NW_024040928.1_RagTag test9.fasta > test10.fasta
+
+/programs/seqkit-0.15.0/seqkit mutate -p 25539541:N -p 25539542:N -p 25539543:N -p 25539544:N -p 25539545:N -p 25539546:N -p 25539547:N -p 25539548:N -p 25539549:N -p 25539550:N -p 25539551:N -p 25539552:N -p 25539553:N -p 25539554:N -p 25539555:N -p 25539556:N -p 25539557:N -p 25539558:N -p 25539559:N -p 25539560:N -p 25539561:N -s NW_024041150.1_RagTag test10.fasta > test11.fasta
+
+/programs/seqkit-0.15.0/seqkit mutate -p 10809862:N -p 10809863:N -p 10809864:N -p 10809865:N -p 10809866:N -p 10809867:N -p 10809868:N -p 10809869:N -p 10809870:N -p 10809871:N -p 10809872:N -p 10809873:N -p 10809874:N -p 10809875:N -p 10809876:N -p 10809877:N -p 10809878:N -p 10809879:N -p 10809880:N -p 10809881:N -p 10809882:N -p 10809883:N -p 10809884:N -p 10809885:N -p 10809886:N -p 10809887:N -p 10809888:N -p 10809889:N -p 10809890:N -p 10809891:N -p 10809892:N -p 10809893:N -p 10809894:N -p 10809895:N -p 10809896:N -p 10809897:N -p 10809898:N -s NW_024044681.1_RagTag test11.fasta > test12.fasta
+
+mv test12.fasta smb_anchored_200bp_trimmed.fasta
+rm *test*
+samtools faidx smb_anchored_200bp_trimmed.fasta
+```
+
+*Finally, we need to rename*
+
+In this block, check how many contigs actually got anchored
+```{r eval=FALSE}
+library(tidyverse)
+
+# Use the index files to look at the contigs
+smb50x_index <- read_tsv('/workdir/smallmouth/genome/old_genomes/smb_50x/smb_50x.scf.fasta.fai',
+                  col_names = c('name', 'length', 'offset', 'linebases', 'lineoffset'))
+
+smbanc_index <- read_tsv('/workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta.fai',
+                  col_names = c('name', 'length', 'offset', 'linebases', 'lineoffset'))
+
+# The contigs in the 50x genome all begin with scf
+smb50x_index %>% 
+  mutate(firstThree = substr(name, 1, 3)) %>% 
+  group_by(firstThree) %>% 
+  summarise(n = n())
+
+# the contigs and scaffolds in anchored chr begin with scf (unanchored), NW (anchored), or NC (mitochondria)
+smbanc_index %>% 
+  mutate(firstThree = substr(name, 1, 3)) %>% 
+  group_by(firstThree) %>% 
+  summarise(n = n())
+
+# Based on the above results, we ended up with 1 mitochondria, 354 scaffolds, and 17,381 contigs
+```
+
+Rename chromosomes as LG, anchored scaffolds, contigs, and mtDNA
+```{r eval=FALSE}
+library(tidyverse)
+# First make a file with all of the contif names
+contigNames <- read_tsv('/workdir/smallmouth/genome/smb_anchored/NCBIupload/smb_anchored_200bp_trimmed.fasta.fai',
+                  col_names = c('lg', 'length', 'offset', 'linebases', 'lineoffset'))
+
+# Another thing that works, real easy (need to run on cmd to get all header names)
+grep 'MtDNA_1' smb_anchored_200bp_trimmed_renamed_sorted.fasta
+
+# Creating a new name column with numbered contog, scaffold, mtDNA, LG
+test<- contigNames %>% 
+  mutate(newnew = if_else(str_detect(lg, 'scf'), 'contig', 
+                  if_else(str_detect(lg, 'NW'), 'scaffold', 'NA'))) %>% 
+  mutate(newName = paste0(newnew, "_",row_number())) %>% 
+  mutate(newestName = if_else(lg == 'NW_024040040.1_RagTag','LG01',
+                      if_else(lg == 'NW_024040041.1_RagTag','LG02',
+                      if_else(lg == 'NW_024040152.1_RagTag','LG03',
+                      if_else(lg == 'NW_024040263.1_RagTag','LG04',
+                      if_else(lg == 'NW_024040374.1_RagTag','LG05',
+                      if_else(lg == 'NW_024040485.1_RagTag','LG06',
+                      if_else(lg == 'NW_024040596.1_RagTag','LG07',
+                      if_else(lg == 'NW_024040707.1_RagTag','LG08',
+                      if_else(lg == 'NW_024040817.1_RagTag','LG09',
+                      if_else(lg == 'NW_024040928.1_RagTag','LG10',
+                      if_else(lg == 'NW_024041039.1_RagTag','LG11',
+                      if_else(lg == 'NW_024041150.1_RagTag','LG12',
+                      if_else(lg == 'NW_024041151.1_RagTag','LG13',
+                      if_else(lg == 'NW_024041262.1_RagTag','LG14',
+                      if_else(lg == 'NW_024041373.1_RagTag','LG15',
+                      if_else(lg == 'NW_024041484.1_RagTag','LG16',
+                      if_else(lg == 'NW_024042261.1_RagTag','LG17',
+                      if_else(lg == 'NW_024043372.1_RagTag','LG18',
+                      if_else(lg == 'NW_024044237.1_RagTag','LG19',
+                      if_else(lg == 'NW_024044348.1_RagTag','LG20',
+                      if_else(lg == 'NW_024044459.1_RagTag','LG21',
+                      if_else(lg == 'NW_024044570.1_RagTag','LG22',
+                      if_else(lg == 'NW_024044681.1_RagTag','LG23', 
+                      if_else(lg == 'NC_008106.1_RagTag', 'z_mtDNA1',
+                      if_else(lg == 'scf7180002174949', 'z_mtDNA2',
+                      if_else(lg == 'scf7180002183473', 'z_mtDNA3',
+                      if_else(lg == 'scf7180002184072', 'z_mtDNA4',
+                      if_else(lg == 'scf7180002185853', 'z_mtDNA5', newName))))))))))))))))))))))))))))) %>% 
+  select(c(lg, newestName))
+  
+write_tsv(test, 
+          '/workdir/smallmouth/genome/smb_anchored/NCBIupload/names.txt',
+           col_names = F)
+
+```
+
+Use awk to replace headers https://stackoverflow.com/questions/57697102/replace-names-in-fasta
+Then sort using header (mtDNA at the end by calling it "z_MtDNA...")
+```{bash eval=FALSE, include=TRUE}
+awk '
+FNR==NR{
+  a[$1]=$2
+  next
+}
+($2 in a) && /^>/{
+  print ">"a[$2]
+  next
+}
+1
+' names.txt FS="[> ]"  smb_anchored_200bp_trimmed.fasta > smb_anchored_200bp_trimmed_renamed.fasta
+
+# index the baby to check
+samtools faidx smb_anchored_200bp_trimmed_renamed.fasta
+
+# sort using header 
+/programs/seqkit-0.15.0/seqkit sort -N smb_anchored_200bp_trimmed_renamed.fasta > smb_anchored_200bp_trimmed_renamed_sorted.fasta
+
+# index the baby to check
+samtools faidx smb_anchored_200bp_trimmed_renamed_sorted.fasta
+```
+  
+Check on the large gap in mtDNA_1
+```{bash eval=FALSE, include=TRUE}
+cd /workdir/smallmouth/genome/smb_anchored/NCBIupload
+export PATH=/programs/bioawk:$PATH
+
+bioawk -c fastx '$name ~ /z_mtDNA1/ { print ">"$name"\n"$seq; }' smb_anchored_200bp_trimmed_renamed_sorted.fasta
+
+# check the original
+bioawk -c fastx '$name ~ /NC_008106.1_RagTag/ { print ">"$name"\n"$seq; }' smb_anchored.fasta
+
+# These gaps were already here, but now that I am claiming the mtDNA part, 
+
+``` 
+  
+remove the mtDNA that NCBI highlighted
+https://bioinformatics.stackexchange.com/questions/3931/remove-delete-sequences-by-id-from-multifasta
+```{bash eval=FALSE, include=TRUE}
+# using the blocklist.txt, remove the contig headers from the fasta
+cd /workdir/smallmouth/genome/smb_anchored/NCBIupload
+
+remove_ids=($(awk '{print $1}' smb_anchored_200bp_trimmed_renamed_sorted.fasta.fai | grep -v -f blocklist.txt))
+
+samtools faidx -o smb_anchored_200bp_trimmed_renamed_sorted_noMtDNA.fasta smb_anchored_200bp_trimmed_renamed_sorted.fasta "${remove_ids[@]}"
+
+samtools faidx smb_anchored_200bp_trimmed_renamed_sorted_noMtDNA.fasta
+
+tail smb_anchored_200bp_trimmed_renamed_sorted_noMtDNA.fasta.fai
+```
+
+Double check that mtDNA removal worked
+```{r eval=FALSE}
+library(tidyverse)
+# Use the index files to look at the contigs
+prefilter <- read_tsv('/workdir/smallmouth/genome/smb_anchored/NCBIupload/smb_anchored_200bp_trimmed_renamed_sorted.fasta.fai',
+                  col_names = c('name', 'length', 'offset', 'linebases', 'lineoffset'))
+
+postfilter <- read_tsv('/workdir/smallmouth/genome/smb_anchored/NCBIupload/smb_anchored_200bp_trimmed_renamed_sorted_noMtDNA.fasta.fai',
+                  col_names = c('name', 'length', 'offset', 'linebases', 'lineoffset'))
+
+# The below should match the blocklist - it did!
+anti_join(prefilter, postfilter, by = 'name')
+
+# File Size got larger? double-check that nothing changed besides contig removal
+  fll<-full_join(prefilter, postfilter, by = 'name')
+  
+  fll %>% 
+    filter(length.x != length.y) # nothing should come back for this
+  
+# Here's our LGs
+postfilter %>% 
+  filter(length > 10000000)
+
+```
+
+
+*Then run FTP connection*
+Following NCBI FTP instructions here. username and pwd may be different for future uploads
+```{bash eval=FALSE, include=TRUE}
+cd /workdir/smallmouth/genome/smb_anchored/NCBIupload
+
+  # establish conection
+  ftp ftp-private.ncbi.nlm.nih.gov
+    Username: subftp
+    Password: w4pYB9VQ
+  
+  # navigate to fodler and create submission. confirm that we are in subdirectory with 'ls' 
+  cd uploads/zarriliam_gmail.com_P714vDIF
+  mkdir smb_anchored_200bpfiltered_trimmed_sorted_noMtDNA
+  cd smb_anchored_200bpfiltered_trimmed_sorted_noMtDNA
+  
+  # transfer file
+  put smb_anchored_200bp_trimmed_renamed_sorted_noMtDNA.fasta
+  
+  # Wait 10 minutes then the folder should show up in "Select Preload folder" on NCBI website
+``` 
+
+DEPRACATED BELOW
+It seems that the best thing to do is to run the assembled (but not anchored) genome through Trimmomatic and then re-anchor
+
+## Create a NCBI uploaded genome that just has uploaded chromosomes
+
+```{bash eval=FALSE, include=TRUE}
+
+cd /workdir/smallmouth/genome/smb_anchored/NCBI_upload
+
+# Set path to use bioawk
+export PATH=/programs/bioawk:$PATH
+
+# subset to get just sequences longer than 500kb and make a new chrs file
+bioawk -c fastx '{ if(length($seq) > 500000) { print ">"$name; print $seq }}' smb_anchored_200bp_trimmed_renamed_sorted_noMtDNA.fasta > smb_anchored_NCBI_chrs.fasta
+
+# Index it and create fai file
+# Info on fai file https://www.htslib.org/doc/faidx.html
+# tab-delimited file, with (1)sequence_name (2)length(bp) (3)location (4th/5th columns I don't understand)
+
+samtools faidx smb_anchored_NCBI_chrs.fasta
+```
+
+## Annotation
+Steps outlined here https://biohpc.cornell.edu/doc/annotation_2018_lecture1.pdf
+These steps are to annotate the whole genome, but for determining what genomic outliers do, I can just annotate those regions
+
+evidence based is using RNA
+ab initio is guessing based off genome (this is likely what we would do)
+
+###Repeat masking
+
+As this is a non-model organism, we need to run RepeatModeler first (see Cornell BioHPC)
+-download and tutorial from http://www.repeatmasker.org/RepeatModeler/
+-gunzip and untar file, then cd and perl ./configure
+May have to install packages with cpanm [package name]
+
+Then run repeatmasker
+
+Make predictions on where coding regions exist (Augustus, Glimmer HMM, GeneMarkHMM)
+
+Align protein sequences from closely related well-annotated genome using GenBlastA (BLAST)
+
+Look into Braker2, UCSC Liftover, and CrossSeq/CrossMap (need is a chain file that tells the software how genome coordinates are related). 
+
+OR blast the protein annotation from largemouth to your smallmouth genome
+
+Refine using GeneWise
+
+Use EVidenceModeler (EVM) to combine gene predictions
+
+### UCSC Liftover
+
+http://ucsc.gao-lab.org/cgi-bin/hgLiftOver
+Should work as it has salmoides and LMB on here already. I just need to figure how to get my genome up as well. 
+
+### Annotation using MAKER on XSEDE - only helpful if we have RNA data. Same with CoGe
+Tutorials
+https://biohpc.cornell.edu/doc/annotation_2018_exercises1.pdf
+https://biohpc.cornell.edu/lab/userguide.aspx?a=software&i=65#c
+http://weatherby.genetics.utah.edu/MAKER/wiki/index.php/MAKER_Tutorial_for_WGS_Assembly_and_Annotation_Winter_School_2018
+
+First, download MAKER (http://www.yandell-lab.org/software/maker.html) and upload it to server (Rstudio upload into /workdir/smallmouth/software)
+
+Login to XSEDE
+```{bash eval=FALSE, include=TRUE}
+ssh genomebr@login.xsede.org # this gets me into login node. password is BassAttack73!
+gsissh bridges2
+quota # check how much time is left
+projects # check what projects I have running & lists charge ID (mcz3a6p)
+cd $PROJECT
+mkdir MAKER
+```
+
+Transfer MAKER software and smb_anchored genome from Therkildsen server to XSEDE, then install
+
+```{bash eval=FALSE, include=TRUE}
+# From Therkildsen server
+scp -P 2222 /workdir/smallmouth/software/maker-3.01.04.tgz genomebr@data.bridges2.psc.edu:/ocean/projects/mcb200006p/genomebr/MAKER
+
+# Do the following from XSEDE
+tar xvfz maker-3.01.04.tgz
+cd maker/src
+Build installdeps
+perl Build.PL
+#when prompted: answer: 1. Y ; 2. /programs/mpich-install/bin/mpicc 3. /programs/mpich-install/include
+./Build install
+```
+
+Install latest version of MAKER
+```{bash eval=FALSE, include=TRUE}
+cd $SCRATCH
+
+```
+
+repeat masker screens for repetitive regions
+
+structural annotation includes finding coding vs noncoding regions, and then identifying the genes within the coding regions
+GFF3 or GTF file, 9 columns
+Functional annotation assigns biological value to the genes
+
+## Working with the annotated genome (NCBI in this case)
+Can be downloaded from https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/021/292/245/GCF_021292245.1_ASM2129224v1
+
+File outputs 
+-cds_from_genomic_fna is the location of all coding sequences
+-GBFF is the fasta sequence with annotations
+-GFF3 is the annotations and list of where in the genome they exist
+-genomic.faa is the fasta file that the annotation is based on. lower case letters are masked, upper case are not
+-feature count lists all the different annotation counts
+-feature table is location and attributes for a subset of annotated features (includes genes, CDS, RNA)
+
+### First, make sure the fasta that I used to re-map my lcwgs samples matches the length of the NCBI file
+```{bash}
+#search for term in gzipped file
+zgrep [search term] [file.gz]
+
+#list number of rows in gzipped file
+zcat [filename] | wc -l
+
+# Annotated fasta
+cd /workdir/smallmouth/genome/smb_anchored/NCBI_annotated
+
+    # Get the header names of all my linkage groups in the annotated file
+    # all of the LG have the identifier "NC"
+    zcat GCF_021292245.1_ASM2129224v1_genomic.fna.gz | grep LG > GCF_021292245.1_ASM2129224v1_genomic.fna.headers.txt
+    
+    #examine sequence length and print with the name
+    export PATH=/programs/bioawk:$PATH
+    bioawk -c fastx '{print ">" $name ORS length($seq)}' GCF_021292245.1_ASM2129224v1_genomic.fna.gz > GCF_021292245.1_ASM2129224v1_genomic.fna.contigLength.txt
+    
+# re-mapped fasta
+cd /workdir/smallmouth/genome/smb_anchored
+
+    # header sequence length
+    bioawk -c fastx '{print ">" $name ORS length($seq)}' smb_anchored_chrs.fasta > smb_anchored_chrs.contigLength.txt
+```
+
+In R, put these together. This is pretty messy but it works. And the number of sequences matches!
+```{r}
+remap_length<-read_tsv('/workdir/smallmouth/genome/smb_anchored/smb_anchored_chrs.contigLength.txt',col_names = 'remap')
+annotate_length<-read_tsv('/workdir/smallmouth/genome/smb_anchored/NCBI_annotated/GCF_021292245.1_ASM2129224v1_genomic.fna.contigLength.txt',col_names = 'annotate') %>% 
+  slice_head(n=46)
+
+# If any length row shows up, it is because they don't match. And guess what, they do!
+matching<-bind_cols(remap_length,annotate_length) %>% 
+  mutate(match=if_else(remap==annotate,1,0)) %>% 
+  filter(match==0)
+View(matching)
+
+# Here, export our new lg_filter list
+lg_filter <- read_csv('/workdir/smallmouth/sample_lists/lg_reference.csv', 
+                      col_names = c('chr', 'lg')) %>% 
+             mutate(name = str_replace(lg, 'LG', '')) %>% 
+             mutate(name = as.integer(name))
+
+matching %>% 
+  mutate(chr=str_replace(remap,'>',''),
+         annotate=str_replace(annotate,'>','')) %>% 
+  select(-c(match,remap)) %>% 
+  left_join(lg_filter,by='chr') %>% 
+  write_csv('/workdir/smallmouth/sample_lists/lg_reference_annotate.csv')
+
+```
+
+### Next, make a table which lists all the gaps in our reference genome
+If we didn't have a gap file, we could follow the this script to do the same with our reference genome
+https://bioinformaticsworkbook.org/dataWrangling/R/visualize-gaps-in-genomes.html#gsc.tab=0
+
+As all of our LGs start with NC, we can easily use grep
+```{bash}
+cd /workdir/smallmouth/genome/smb_anchored/NCBI_annotated
+zcat GCF_021292245.1_ASM2129224v1_genomic_gaps.txt.gz | grep NC > GCF_021292245.1_ASM2129224v1_genomic_gaps.LGs.txt
+```
+
+replace the header names with LG
+```{r}
+lg_filter<-read_csv('/workdir/smallmouth/sample_lists/lg_reference_annotate.csv')
+gaps<-read_tsv('/workdir/smallmouth/genome/smb_anchored/NCBI_annotated/GCF_021292245.1_ASM2129224v1_genomic_gaps.LGs.txt', col_names = c('annotate','start','end','length','NA1','NA2')) %>% 
+  select(-c('NA1','NA2')) %>% 
+  left_join(lg_filter,by='annotate') %>% 
+  write_csv('/workdir/smallmouth/genome/smb_anchored/NCBI_annotated/gaps_cleaned.csv')
+
+```
+
+### generate a table of locations which excludes all coding regions and a 50kbp buffer around them
+Here's a good page on the organization of the gff file
+https://github.com/The-Sequence-Ontology/Specifications/blob/master/gff3.md
+
+```{bash}
+# Filer the gff to just include chromosomes
+zgrep NC GCF_021292245.1_ASM2129224v1_genomic.gff.gz | gzip > GCF_021292245.1_ASM2129224v1_genomic_chromosomes.gff.gz
+
+# make a new file with just coding regions. Need to unzip then run again
+zcat GCF_021292245.1_ASM2129224v1_genomic_chromosomes.gff.gz > GCF_021292245.1_ASM2129224v1_genomic_chromosomes.gff
+column -s, -t < GCF_021292245.1_ASM2129224v1_genomic_chromosomes.gff | awk '$3 == "gene"' > GCF_021292245.1_ASM2129224v1_genomic_chromosomes_gene.gff
+```
+
+```{r}
+read_tsv('/workdir/smallmouth/genome/smb_anchored/NCBI_annotated/GCF_021292245.1_ASM2129224v1_genomic_chromosomes_gene.gff', col_names = c('annotate','algorithm','gene','start','end','NA1','NA2','NA3','info')) %>% 
+  dplyr::select(-c('algorithm','gene','NA1','NA2','NA3','info')) %>% 
+  mutate(start50=start-50*1000,
+         end50=end+50*1000,
+         start20=start-20*1000,
+         end20=end+20*1000,
+         start20=if_else(start20<0,0,start20),
+         start50=if_else(start50<0,0,start50)) %>%
+  write_tsv('/workdir/smallmouth/genome/smb_anchored/NCBI_annotated/GCF_021292245.1_ASM2129224v1_genomic_chromosomes_gene_50kbp.tsv')
+
+```
+
+### How many coding regions and protein coding regions are there in each chromosome?
+
+First, subset the gff file for columns 1,3,4,5
+```{bash}
+cd /workdir/smallmouth/genome/smb_anchored/NCBI_annotated
+awk '{print $1,$3,$4,$5}' GCF_021292245.1_ASM2129224v1_genomic_chromosomes.gff > GCF_021292245.1_ASM2129224v1_genomic_chromosomes_subset.gff
+```
+
+```{r}
+gff<-read_delim('/workdir/smallmouth/genome/smb_anchored/NCBI_annotated/GCF_021292245.1_ASM2129224v1_genomic_chromosomes_subset.gff', skip=4,delim = ' ', col_names = c('annotate','type','start','end'))
+  
+
+gff %>% 
+  group_by(annotate,type) %>% 
+  summarise(n=n()) %>% 
+  ungroup() %>% 
+  left_join(lg_filter, by='annotate') %>% 
+  filter(!is.na(name)) %>% 
+  dplyr::select(c('lg','type','n')) %>% 
+  pivot_wider(names_from = type, values_from=n) %>% 
+  write_csv('/workdir/smallmouth/genome/smb_anchored/NCBI_annotated/gff_summary_chrs.csv')
+```
+
+### Any coding regions in high-Fst regions?
+
+Subset the gff file for chrs of interest
+```{bash}
+# LG19
+cd /workdir/smallmouth/genome/smb_anchored/NCBI_annotated
+grep NC_060168.1 GCF_021292245.1_ASM2129224v1_genomic_chromosomes.gff > GCF_021292245.1_ASM2129224v1_LG19.gff
+
+# LG6
+cd /workdir/smallmouth/genome/smb_anchored/NCBI_annotated
+grep NC_060155.1 GCF_021292245.1_ASM2129224v1_genomic_chromosomes.gff > GCF_021292245.1_ASM2129224v1_LG6.gff
+
+NC_060155.1
+```
+
+```{r}
+excursions<-read_csv('/workdir/smallmouth/sample_lists/excur_all_A_D.csv') # LG6 and LG19
+lg_filter
+
+chr<-6 # 19
+
+gff <- read_tsv(paste0('/workdir/smallmouth/genome/smb_anchored/NCBI_annotated/GCF_021292245.1_ASM2129224v1_LG',chr,'.gff'), skip = 2, col_names = c('annotate','model','type','start','end','X1','X2','X3','description')) %>% 
+  dplyr::select(annotate,type,start,end,description) %>% 
+  separate(description, sep= ';', into=c('ID','Dbxref','Name','gbkey','gene','gene_biotype')) %>% 
+  mutate(ID=str_replace(ID,'ID=',''))
+
+# LG19
+    # What is in the inversion? 10620000 to 25055000
+      # subset the chromosome
+        gff_inversion<-gff %>% 
+          filter(between(start,10620000, 25055000) | between(end,10620000, 25055000)) 
+        
+      # What different types of regions do we see?
+        group_by(type) %>% 
+          summarise(n=n())
+    
+      # Start with genes
+        gff_inversion %>% 
+          filter(type=='gene') %>% 
+          filter(str_detect(ID,'greb')) # Here look for particular genes
+        
+      # To look for a particular gene in the whole genome, grep [gene] GCF_021292245.1_ASM2129224v1_genomic.gff
+        lg_filter
+        
+# LG6
+  st<-as.integer(excursions[3,]$snpStartPosition)
+  en<-as.integer(excursions[3,]$snpEndPosition)
+  
+  class(st)
+
+  gff %>% 
+    filter(between(start,st,en) | between(end,st,en)) %>% 
+    filter(type=='gene')
+
+```
+
+## look at putative inversion breakpoints
+
+Export the chromosomes containing the putative supergene to upload in IGV viewer
+```{bash}
+# Subset LG19 to download - remember we need to use the annotated LG name
+cd /workdir/smallmouth/genome/smb_anchored/NCBI_annotated
+gunzip GCF_021292245.1_ASM2129224v1_genomic.fna.gz # unzip the reference genome
+samtools faidx GCF_021292245.1_ASM2129224v1_genomic.fna # index it
+samtools faidx GCF_021292245.1_ASM2129224v1_genomic.fna NC_060168.1 >  GCF_021292245.1_ASM2129224v1_genomic_LG19.fna # subset for LG19
+samtools faidx GCF_021292245.1_ASM2129224v1_genomic_LG19.fna # index it, as igv browser needs this
+# export and upload to the igv browser. Need to simultaneously upload the fasta and the index file
+```
+
+Look at the Fst plot to identify breakpoints
+```{r}
+fst <- read_tsv(paste0('/workdir/smallmouth/angsd/popminind20/A_D_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.fst'), col_names = c('lg', 'pos', 'alpha', 'beta', 'fst')) %>% 
+  filter(lg=='NW_024044237.1_RagTag')
+
+fst %>% 
+  #filter(between(pos,1e07,2.3e07)) %>% 
+  ggplot(aes(pos, fst)) +
+  geom_point()
+
+# start is between 10620000 and 10630000
+fst %>% 
+  filter(between(pos,1.062e07,1.063e07)) %>% 
+  ggplot(aes(pos, fst)) +
+  geom_point()
+
+# end1 is between 21280000 and 21290000
+fst %>% 
+  filter(between(pos,2.128e07,2.129e07)) %>% 
+  ggplot(aes(pos, fst)) +
+  geom_point()
+
+# end2 is between 25045000 and 25055000
+fst %>% 
+  filter(between(pos,2.504e07,2.506e07)) %>% 
+  ggplot(aes(pos, fst)) +
+  geom_point()
+```
+
+Do we see gaps at either end of the inversion? yes, some 100bp gaps, which means there isn't an estimate of size
+```{r}
+gaps<-read_tsv('/workdir/smallmouth/genome/smb_anchored/NCBI_annotated/GCF_021292245.1_ASM2129224v1_genomic_gaps.LGs.txt', col_names = c('annotate','start','end','length','NA1','NA2')) %>% 
+  select(-c('NA1','NA2')) %>% 
+  left_join(lg_filter,by='annotate') %>% 
+  write_csv('/workdir/smallmouth/genome/smb_anchored/NCBI_annotated/gaps_cleaned.csv')
+
+# start 10620000 and 10630000
+win<-20*1000
+str<-10620000-win
+en<-10630000+win
+gaps %>% 
+  filter(name==19) %>% 
+  filter(between(start,str,en) | between(end,str,en))
+
+# end 21280000 and 21290000
+win<-20*1000
+str<-21280000-win
+en<-21290000+win
+gaps %>% 
+  filter(name==19) %>% 
+  filter(between(start,str,en) | between(end,str,en))
+
+# end 25045000 and 25055000
+win<-30*1000
+str<-25045000-win
+en<-25055000+win
+gaps %>% 
+  filter(name==19) %>% 
+  filter(between(start,str,en) | between(end,str,en))
+```
+
+## Random-blast Carl's region against my genome

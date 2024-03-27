@@ -1,0 +1,908 @@
+---
+title: "gtseq"
+output: html_document
+date: '2022-05-10'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Import packages and setwd
+```{r message=F, warning=F}
+library(tidyverse)
+library(cowplot)
+library(ape)
+library(pegas)
+library(RColorBrewer)
+library(knitr)
+library(insect)
+library(RcppCNPy)
+library(scales)
+#library(ggpubr) # for ggarrange, putting multiple graphs on the same plot
+#library(ggpmisc) # put formula on ggplot
+library(Biostrings) # fasta in R
+library(seqinr) # fasta in R
+source("/workdir/genomic-data-analysis/scripts/individual_pca_functions.R")
+
+setwd('/workdir/smallmouth')
+
+# Import our chromosome names
+lg_filter <- read_csv('/workdir/smallmouth/sample_lists/lg_reference_annotate.csv')
+
+chr_duplicated<-read_tsv('/workdir/smallmouth/sample_lists/chr_duplicated.tsv')
+
+ChrLength <- read_tsv('/workdir/smallmouth/genome/smb_anchored/smb_anchored_chrs.fasta.fai',
+                      col_names = c('chr', 'length')) %>% 
+              dplyr::select(chr,length)
+
+lg_filter <- left_join(lg_filter,ChrLength,by='chr')
+
+# bring in average maf for A and D
+  maf_D<-as_tibble(read.table(gzfile(paste0('/workdir/smallmouth/angsd/popminind20/D_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.mafs.gz')), header = TRUE)) %>% 
+    filter(between(knownEM, 0.005, 0.995)) %>% 
+    dplyr::select(chromo, position, knownEM_D=knownEM)
+  maf_A<-as_tibble(read.table(gzfile(paste0('/workdir/smallmouth/angsd/popminind20/A_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.mafs.gz')), header = TRUE)) %>% 
+    filter(between(knownEM, 0.005, 0.995)) %>% 
+    dplyr::select(chromo, position, knownEM_A=knownEM)
+  maf_A_D<-
+    full_join(maf_D, maf_A, by=c('chromo','position')) %>% 
+    dplyr::rename(chr=chromo, snp_position=position) %>% 
+    pivot_longer(!c(chr, snp_position), names_to='pop', values_to='maf') %>% 
+    filter(!is.na(maf)) %>% 
+    group_by(chr, snp_position) %>% 
+    summarise(mean_af=mean(maf))
+
+# # Here I make the pop_order, and import as well
+# pop_order<-tibble(population=c('A','B','C', 'D','E','F'),
+#                   Water=c( 'Little Moose pre-removal','First Bisby pre-removal','First Bisby removed', 'Little Moose removed','Third Bisby no removal','Woodhull no removal'),
+#                   removed=c('N','N','Y','Y','N','N'))
+# write_csv(pop_order,'/workdir/smallmouth/sample_lists/pop_order.csv')
+
+pop_order<-read_csv('/workdir/smallmouth/sample_lists/pop_order.csv')
+
+sample_table<-read_tsv("/workdir/smallmouth/sample_lists/sample_table_merged_smb_anchored_mincov_filtered.tsv") %>%
+  left_join(pop_order, by='population')
+
+```
+
+# find regions of interest
+## Parentage panel
+
+### filter global SNP list using reference bias, fst, and maf
+We are going 150pe sequencing. Take the 300bp region, subtrat 10 (overlap in the middle), subtract 40 (2 20bp primers), giving us 250 fragment and a 125bp window
+```{r}
+  # filter to loci that work in all pops (maf at some intermediate frequency in all pops)
+
+    # Import all SNP lists
+        UnprunedSnpList <- as_tibble(read.table(gzfile(paste0('/workdir/smallmouth/angsd/bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20.mafs.gz')), header = T)) %>% 
+          dplyr::rename(chr=chromo)
+
+        refBias <- read_tsv("/workdir/smallmouth/angsd/global_snp_list_depth_ratio_filtered.txt", col_names = c("lg", "position")) %>% 
+            mutate(keep_ref=T) %>% 
+          dplyr::rename(chr=lg)
+        
+        snps_nocoding<-as_tibble(read.table(gzfile('/workdir/smallmouth/angsd/bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_downsampled_0kbp_buffer.txt.gz'),col.names = c('chr','position','maj','min')))
+        
+    # Join SNP lists and get rid of fixed alleles and ones that aren't in refBias
+        downsampled<-left_join(snps_nocoding, UnprunedSnpList, by=c('chr','position')) %>% 
+          left_join(refBias, by=c('chr','position')) %>% 
+          left_join(lg_filter, by=c('chr')) %>% 
+          filter(keep_ref==T, 
+                 between(knownEM, 0.005, 0.995)) %>% 
+          dplyr::select(c(chr, position, maj, min, knownEM_global=knownEM, nInd_global=nInd))
+    
+    # filter for those with maf>0.35
+        output <- tibble()
+        maf_filter<-0.35
+    
+        for(i in c('A', 'D')) { # 'B', 'C',  , 'E', 'F'
+          tryCatch({
+    
+            pop_maf <- as_tibble(read.table(gzfile(paste0('/workdir/smallmouth/angsd/popminind20/', i, '_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.mafs.gz')), header = TRUE)) %>% 
+              dplyr::rename(chr=chromo)
+            
+            tibOut<-left_join(downsampled, pop_maf, by=c('chr','position')) %>% 
+              filter(between(knownEM, maf_filter, (1-maf_filter))) %>% 
+              dplyr::select(c(chr,position, knownEM, nInd)) %>% 
+              mutate(pop=i)
+    
+            output <- bind_rows(tibOut, output)
+          }, error = function(e) {cat('error in population', i, '\n')})
+        }
+        
+    # filter for only ones that show up in the populations we are interested in (A/D)
+    
+    output6<-output %>% 
+      dplyr::select(c(chr, position,knownEM, pop)) %>% 
+      tidyr::pivot_wider(names_from = pop, values_from=knownEM) %>% 
+      filter(!is.na(A),  !is.na(D)) %>% # !is.na(B), !is.na(C),!is.na(E), !is.na(F)
+      left_join(lg_filter, by='chr')
+    
+    # Filter Fst values
+      # First, make sure there are no SNPs in our differentiated regions
+        # excursions<-read_csv('/workdir/smallmouth/local_score/fst_excursions_A_D.csv')[1:3,] # Remove the small region
+  
+        output6_fst_filter_differentiated<- output6 %>% 
+                              mutate(keep = if_else(name==6 & between(position,2000000, 4500000), F, 
+                                                    if_else(name==7 & between(position,23000000,26500000),F,
+                                                            if_else(name==19 & between(position,10500000,21500000), F, T)))) %>% 
+                              filter(keep==T)
+   
+    
+      # then, remove the SNPs that show Fst values greater than 1sd away from the mean
+          output6_chrPos<-output6_fst_filter_differentiated %>% 
+            dplyr::select(chr,position)
+          
+          fst_out<-tibble(temp=1:nrow(output6_chrPos))
+          fst_vals_out<-tibble()
+          
+            for(i in c('A_D','B_C','D_F','C_E')){
+              
+              # Import the fst values
+                fst_base<-read_tsv(paste0("/workdir/smallmouth/angsd/popminind20/",i,"_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.fst"), col_names = c("chr", "position", "alpha", "beta", "fst")) %>%
+                  dplyr::select(-c('alpha', 'beta'))
+              
+              # First we want to calculate the mean and sd for all neutral downsampled SNPs in the fst comparison
+                fst_vals_in<-left_join(downsampled,fst_base, by=c('chr','position')) %>% 
+                  filter(!is.na(fst)) %>% 
+                  summarise(meanFst=mean(fst),
+                            sdFst=sd(fst),
+                            comp=paste0('fst_',i))
+                fst_vals_out<-bind_rows(fst_vals_out, fst_vals_in)
+              
+              # Next we want to add the fst values for each of the neutral SNPs
+                fst_in <- fst_base %>% 
+                  right_join(output6_chrPos, by=c('chr','position')) %>% 
+                  dplyr::rename(!!(paste0('fst_',i)):=fst) %>% 
+                  dplyr::select(-c(chr,position))
+        
+                fst_out<-bind_cols(fst_out,fst_in)
+            }
+      
+          output6_fst<-bind_cols(output6_fst_filter_differentiated,fst_out)
+          
+          # Here we filter the neutral SNPs for those that are within 1sd of the mean fst for our four comparisons
+            output6_fst_filter<-output6_fst %>% 
+              mutate(chr_pos = paste0(chr,'__',position)) %>% 
+              dplyr::select(chr_pos, fst_A_D, fst_B_C,fst_D_F,fst_C_E) %>% 
+              pivot_longer(!chr_pos,names_to='comp',values_to='val') %>% 
+              left_join(fst_vals_out, by='comp') %>% 
+              filter(val > (meanFst-sdFst), val < (meanFst+sdFst)) %>% 
+              dplyr::select(chr_pos, comp, val) %>% 
+              pivot_wider(names_from = comp, values_from = val) %>% 
+              filter(!is.na(fst_A_D)) %>%  # , !is.na(fst_C_E), !is.na(fst_B_C), !is.na(fst_D_F)
+              separate(chr_pos, sep= '__', into=c('chr','position')) %>% 
+              mutate(position=as.double(position))
+            
+      # For the methods, how much do we filter down SNPs
+        nrow(UnprunedSnpList) # unpruned list count
+        nrow(downsampled) # non-coding and reference bias
+        nrow(output6) # remove snps with minmaf lower than 0.35
+        nrow(output6_fst_filter_differentiated)  # remove snps inside the highly-differentiated regions
+        nrow(output6_fst_filter) # remove snps with fst outside 1sd of mean fst
+        
+      # Write the chr and pos for downstream R analysis
+        write_csv(output6_fst_filter, '/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst.csv')
+        
+      # Write the chr pos for HWE angsd filtering
+        output6_fst_filter %>% 
+          dplyr::select(chr, position) %>% 
+          write_tsv('/workdir/smallmouth/gtseq/angsd/parentage_panel_HWE_forangsd.txt', col_names = F)
+            
+```
+
+### Exclude loci not in HWE, and exclude microhaps with less than 3 SNPs
+
+In angsd, run HWE filters for populations A and D
+```{bash}
+# First we index our sites file (creates a .idx and a .bin file from the snp location file)
+/workdir/programs/angsd0.931/angsd/angsd sites index /workdir/smallmouth/gtseq/angsd/parentage_panel_HWE_forangsd.txt
+
+# Next run for both populations. This took about 5 hours for each population. Not including a SNP_pval or postCutoff
+    
+    # A  
+        nohup /workdir/programs/angsd0.931/angsd/angsd \
+        -bam /workdir/smallmouth/sample_lists/bam_list_per_pop/bam_list_realigned_A.txt \
+        -doHWE 1 \
+        -GL 1 \
+        -doMajorMinor 1 \
+        -out /workdir/smallmouth/gtseq/angsd/parentage_panel_HWE_forangsd_popA.txt \
+        -doMaf 2 \
+        -sites /workdir/smallmouth/gtseq/angsd/parentage_panel_HWE_forangsd.txt \
+        > /workdir/smallmouth/nohups/HWEfilter_A.nohup &
+    # D
+        nohup /workdir/programs/angsd0.931/angsd/angsd \
+        -bam /workdir/smallmouth/sample_lists/bam_list_per_pop/bam_list_realigned_D.txt \
+        -doHWE 1 \
+        -GL 1 \
+        -doMajorMinor 1 \
+        -out /workdir/smallmouth/gtseq/angsd/parentage_panel_HWE_forangsd_popD.txt \
+        -doMaf 2 \
+        -sites /workdir/smallmouth/gtseq/angsd/parentage_panel_HWE_forangsd.txt \
+        > /workdir/smallmouth/nohups/HWEfilter_D.nohup &
+```
+
+filter based on HWE data and microhap info
+```{r}
+# Import HWE info and filter SNP list to 1e-06
+output_fst_hwe<-read_tsv('/workdir/smallmouth/gtseq/angsd/parentage_panel_HWE_forangsd_popD.txt.hwe.gz') %>% 
+  dplyr::select(Chromo, Position, D=`p-value`) %>% 
+  left_join(read_tsv('/workdir/smallmouth/gtseq/angsd/parentage_panel_HWE_forangsd_popA.txt.hwe.gz'), by=c('Chromo','Position')) %>% 
+  dplyr::select(Chromo, Position, D, A=`p-value`) %>% 
+  pivot_longer(!c(Chromo, Position), names_to = 'pop', values_to='pval') %>% 
+  filter(pval>1e-06) %>% 
+  pivot_wider(names_from = pop, values_from = pval) %>% 
+  filter(!is.na(D), !is.na(A)) %>% 
+  dplyr::select(chr=Chromo, position=Position) %>% 
+  left_join(read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst.csv'), by=c('chr','position')) %>% 
+  dplyr::select(chr, position)
+
+# Start running microhaps
+        window<-125 # Check how many SNPs there are within this window
+        
+        output_fst_hwe_microhap <-
+          output_fst_hwe %>% 
+          mutate(pos=as.numeric(as.character(cut(position, breaks=seq(0,50*10^6,(window*2)), 
+                         labels=seq((window*2)/2,50*10^6-(window*2)/2,(window*2)))))) %>% 
+          group_by(chr, pos) %>%
+          summarise(n = n()) %>% 
+          filter(between(n,3,6)) %>% # change this depending on how many SNPs there actually are per window
+          left_join(lg_filter, by='chr')
+            
+        # Double check to make sure no SNPs are at the beginning or end of a chr
+          output_fst_hwe_microhap_chrEnd<-output_fst_hwe_microhap %>% 
+            filter(pos > 200, pos < length-200)
+
+     # methods - nrow?
+        nrow(output_fst_hwe)
+        nrow(output_fst_hwe_microhap) # Microhaps of n=3-6 SNPs
+        nrow(output_fst_hwe_microhap_chrEnd) # Remove any that are near the beginning or the end of a chr
+        
+    # Write the final haplotype flanking region positions to csv for extraction of fasta sequences
+        output_fst_hwe_microhap_chrEnd %>% 
+          mutate(pos_start=pos-window,
+                 pos_end=pos+window) %>% 
+        write_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap.csv')
+```
+
+### Subset fasta for each microhap and exclude microhaps that have N's 
+
+Here, subset fasta at each microhaplotype  
+Then, remove sequences with N's in the middle of the sequence
+Finally, for the sequences that remain which have N's at either end, get rid of these N's (slightly shorter sequence)
+```{r}
+library(Biostrings)
+library(seqinr)
+fasta_smb = readDNAStringSet('/workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta')
+microhap_prelim <-  read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap.csv')
+
+# How much larger should the fasta subsetting region be than the region we search for mhaps? This is implemented when we subset the fasta
+window_extended<-75 # increased so we have 200bp windows - this gives me more space to build primers
+
+sequence_names_out<-tibble()
+
+for(i in 1:nrow(microhap_prelim)){
+  chrom<-as.character(microhap_prelim[i,1])
+  start_pos<-as.integer(microhap_prelim[i,8])
+  end_pos<-as.integer(microhap_prelim[i,9])
+
+  # Ok so this part was a bit tricky. Normally we could just subset the fasta like fasta_smb$NW_024040040.1_RagTag[28469:28619] but this didn't work with variables - hence the below, which is a bit clunky, but works
+  fasta_chr<-fasta_smb[chrom]
+  fasta_chr_sequence<- tibble(microhap_sequence=toString(subseq(fasta_chr, start = start_pos-window_extended, end = end_pos+window_extended)))
+  
+  # Write the name
+  fasta_chr_name<-tibble(microhap_name=paste0("parentage_",chrom,"_start",start_pos,"_end",end_pos))
+  
+  # Add sequence and name to a tibble, then add to a growing list
+  sequence_names_in<-bind_cols(fasta_chr_name,fasta_chr_sequence)
+  sequence_names_out<-bind_rows(sequence_names_in,sequence_names_out)
+}
+
+# Check that our sequence lengths are the right length (should be 401)
+str_count(sequence_names_out$microhap_sequence[1])
+
+# Here we can check for any sequences that have N's
+sequence_names_out %>% 
+  filter(grepl('n',microhap_sequence, ignore.case = T))
+
+# Open up the csv and see if the N's are at the beginning/end of the sequence (probably ok) or if they are in the middle (not ok)
+# Now, filter out the flanking sequences with lots of N's
+# After fixing the issue with factors converting to integer we are all good - no N's!
+sequence_names_out_noN<-
+  sequence_names_out %>% 
+  # filter(microhap_name != 'parentage_NW_024041039.1_RagTag_start116652_end116902',
+  #        microhap_name != 'parentage_NW_024040707.1_RagTag_start102934_end103184',
+  #        microhap_name != 'parentage_NW_024040707.1_RagTag_start99872_end100122',
+  #        microhap_name != 'parentage_NW_024040707.1_RagTag_start2113_end2363') %>% 
+  mutate(microhap_sequence=str_replace_all(microhap_sequence,'N',''))  # Remove the N's from the end of the flanking sequence
+
+# Can double-check here that we have removed bad sequences
+  # should not have any rows
+    sequence_names_out_noN %>% 
+      filter(grepl('n',microhap_sequence, ignore.case = T))
+
+  # This will tell us how long our sequence strings are
+    sequence_names_out_noN %>% 
+      mutate(sequence_length=str_length(microhap_sequence)) %>% 
+      group_by(sequence_length) %>% 
+      summarise(n=n())
+
+# Keeping sequences with N's at beginning or end
+write.fasta(sequences = as.list(sequence_names_out_noN$microhap_sequence), names = sequence_names_out_noN$microhap_name, file.out = '/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN.fasta')
+
+# For our methods - how many microhaps do we have now?
+nrow(sequence_names_out_noN)
+
+```
+
+### BLAST these microhapltypes against the genome to exclude TE's or chromosomal duplications
+Diana used blat—the blast-Like Alignment Tool (Kent, 2002), I'm using BLAST
+```{bash}
+# Work with blast on the command line - give me only sequences that are exact matches (100% identity). In the R script I only keep alignment length 151
+  # https://open.oregonstate.education/computationalbiology/chapter/command-line-blast/
+  # outfmt commands https://www.ncbi.nlm.nih.gov/books/NBK279684/table/appendices.T.options_common_to_all_blast/
+  # fields are sequence_id (of the fasta from above), e-value (probability of alignment being random), alignment length, percent identity, bp start, bp end
+      /programs/ncbi-blast-2.9.0+/bin/blastn -query /workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN.fasta -subject /workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta -outfmt '6 qseqid evalue length pident sstart send' -perc_identity 98 -out /workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN.blast
+
+```
+
+now import the blast results and filter for just ones that have 301 length and >95% identity
+```{r}
+# REad in results and filter for alignment length == 151bp
+blast_results<-read_tsv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN.blast', col_names = c('microhap_name','evalue','fragment_length','percent_identity', 'bp_start','bp_end')) %>% 
+  filter(fragment_length==401)
+
+# Exclude the fragments that show up in more than 1 place in the genome
+blast_filtered<-blast_results %>% 
+  group_by(microhap_name) %>% 
+  summarise(occurences=n()) %>% 
+  right_join(blast_results, by='microhap_name') %>% 
+  dplyr::select(microhap_name,occurences)
+
+# Here, join this to the microhap_preliminary tibble and exclude the repetitive regions
+microhap_nonrepeated<-
+  read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap.csv') %>% 
+  mutate(microhap_name=paste0('parentage_',chr,'_start',pos_start,'_end',pos_end)) %>% 
+  right_join(blast_filtered, by='microhap_name') %>% 
+  filter(occurences==1)
+
+# Export and list the number of microhaps we have left
+nrow(microhap_nonrepeated)
+write_csv(microhap_nonrepeated, '/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive.csv')
+```
+
+### Extract the individual haplotypes 
+
+this is for just the SNPs that pass our maf, fst, and reference bias filters
+```{r}
+# import SNP list
+all_snps<-read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst.csv') %>% 
+  dplyr::select(chr, position)
+
+# Import the current working microhap list
+microhap_nonrepeated<-
+      read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive.csv') %>% 
+      dplyr::select(microhap_name,chr,pos_start,pos_end) 
+
+# For each of the microhaps, pull the position of each SNP that passes above filters
+
+full_position_out<-tibble()
+for(i in 1:nrow(microhap_nonrepeated)){
+  full_position_in<-all_snps %>%
+    filter(chr==microhap_nonrepeated$chr[i], between(position, microhap_nonrepeated$pos_start[i], microhap_nonrepeated$pos_end[i])) %>%
+    mutate(microhap_name=microhap_nonrepeated$microhap_name[i],
+           pos_start=microhap_nonrepeated$pos_start[i],
+           pos_end=microhap_nonrepeated$pos_end[i]) %>%
+    dplyr::select(microhap_name, chr, pos_start, pos_end, position)
+  
+  full_position_out<-bind_rows(full_position_out, full_position_in)
+}
+
+# Generate the sites file for our list of regions
+      full_position_out %>% 
+      mutate(relative_position=position-pos_start) %>% 
+      dplyr::select(chr, position) %>% 
+      write_tsv('/workdir/smallmouth/gtseq/angsd/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions.txt', col_names = F)
+      
+# Export the microhap panel
+      full_position_out %>% 
+      mutate(relative_position=position-pos_start) %>% 
+      write_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions.csv')
+      
+```
+
+call genotypes. 
+-doGeno 4 should give us the actual genotype calls per individual and per position
+-doPost 2 uses a uniform prior. Move towards using -doPost 1 (uses AF as a prior), may need to give it maf file?
+```{bash}
+# First we index our sites file (creates a .idx and a .bin file from the snp location file)
+/workdir/programs/angsd0.931/angsd/angsd sites index /workdir/smallmouth/gtseq/angsd/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions.txt
+
+# Next run for both populations. This took about 5 hours for each population. Not including a SNP_pval, and the postCutoff is very low
+    
+    # A  
+        
+        nohup /workdir/programs/angsd0.931/angsd/angsd \
+        -bam /workdir/smallmouth/sample_lists/bam_list_per_pop/bam_list_realigned_A.txt \
+        -GL 1 \
+        -out /workdir/smallmouth/gtseq/angsd/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_A_noFilter.txt \
+        -doMaf 2 \
+        -doMajorMinor 1 \
+        -doGeno 4 \
+        -doPost 1 \
+        -postCutoff 0.35 \
+        -sites /workdir/smallmouth/gtseq/angsd/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions.txt \
+        > /workdir/smallmouth/nohups/genotype_calls_A_noFilter.nohup &
+        
+    # D 
+        
+        nohup /workdir/programs/angsd0.931/angsd/angsd \
+        -bam /workdir/smallmouth/sample_lists/bam_list_per_pop/bam_list_realigned_D.txt \
+        -GL 1 \
+        -out /workdir/smallmouth/gtseq/angsd/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_D_noFilter.txt \
+        -doMaf 2 \
+        -doMajorMinor 1 \
+        -doGeno 4 \
+        -doPost 1 \
+        -postCutoff 0.35 \
+        -sites /workdir/smallmouth/gtseq/angsd/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions.txt \
+        > /workdir/smallmouth/nohups/genotype_calls_D_noFilter.nohup &
+```
+
+### import the called genotypes, score each microhap using diversity, and use this to LD filter
+```{r}
+# First we need to make lists of the names
+# Population A or D
+  # read_tsv('/workdir/smallmouth/sample_lists/bam_list_per_pop/bam_list_realigned_D.txt', col_names = 'path') %>% 
+  # mutate(name_temp=str_replace(path, '/workdir/smallmouth/bam/',''),
+  #        name_temp2=substr(name_temp,1,3),
+  #        name=str_replace(name_temp2, "_","")) %>% 
+  # dplyr::select(name) %>% 
+  # as.list()
+
+  # Just print it out here and add some commas, chr, and pos
+    
+    list_names_A<-c("chr", "position", "A10", "A11", "A12", "A13", "A14", "A15", "A16", "A17", "A18", "A19", "A2",  "A20", "A21", "A22", "A23", "A24", "A25", "A27", "A28", "A31", "A32", "A33", "A34", "A36", "A37", "A38", "A39", "A40", "A41", "A42", "A43", "A8",  "A9", "drop")
+    
+    list_names_D<-c("chr","position","D1","D10", "D11", "D12", "D13", "D14", "D15", "D16", "D17", "D18", "D19", "D2",  "D20", "D21", "D22", "D23", "D24", "D25", "D26", "D27", "D28", "D29", "D3",  "D30", "D31", "D32", "D33", "D34", "D35", "D4",  "D5",  "D6",  "D7",  "D8",  "D9", "drop2")
+  
+  # Use as the column names for our incoming genotypes 
+  global_databaset<-
+    read_tsv('/workdir/smallmouth/gtseq/angsd/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_A_noFilter.txt.geno.gz', col_names=list_names_A) %>% 
+    full_join(read_tsv('/workdir/smallmouth/gtseq/angsd/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_D_noFilter.txt.geno.gz', col_names=list_names_D), by=c('chr','position')) %>% 
+    left_join(read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions.csv'), by=c('chr','position')) %>% 
+    dplyr::select(-c(pos_start, pos_end, relative_position, drop, drop2)) # For some reason some extra columns came in, dropping
+  
+  # Here, make the joiner table so that TA and AT are the same
+  genos_joiner<-read_csv('/workdir/smallmouth/gtseq/genotypes_lookup.csv')
+  
+  # Iteratively go over each locus and get genotype count (of the whole haplotype) and sw index. in here, we also grab and subset for ckmrsim
+    library(vegan)
+
+  allHapsout<-tibble()
+  ckmrsim_out<-tibble()
+  for(i in unique(global_databaset$microhap_name)){
+    loop_in<-global_databaset %>% 
+      filter(microhap_name==i) %>% 
+      dplyr::select(-c(microhap_name, chr, position)) %>% 
+      mutate(position_temp=1:nrow(filter(global_databaset, microhap_name==i)))
+    
+    cols_max<-max(loop_in$position_temp)+1
+    
+    allHapsIn<-loop_in %>% 
+      pivot_longer(!position_temp, names_to = 'individual', values_to = 'genotype') %>% 
+      left_join(genos_joiner, by='genotype') %>% 
+      dplyr::select(position_temp, individual, genotype=out) %>% 
+      pivot_wider(names_from = 'position_temp', values_from = 'genotype') %>% 
+      unite("all", 2:cols_max) %>% 
+      filter(!str_detect(all, "NN")) %>% # Remove any individuals which have missing genotypes for any position
+      group_by(all) %>% 
+      summarise(n=n())
+    
+    # Here, grab this and save for the future ckmr sim
+    ckmrsim_in<- allHapsIn %>% 
+      mutate(microhap_name=i)
+    ckmrsim_out<-bind_rows(ckmrsim_out,ckmrsim_in)
+    
+    # return to doing SW index of diversity to score each microhap
+    allHapsIn <- allHapsIn %>% 
+      summarise(SW_index=diversity(n, index='shannon'),
+                nhaps=n()) %>% 
+      mutate(microhap_name=i)
+    allHapsout<-bind_rows(allHapsout,allHapsIn)
+  }
+  
+  write_csv(allHapsout, '/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_haploScore.csv')
+  write_csv(ckmrsim_out, '/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_ckmrsiminput.csv')
+  
+```
+
+Remove loci that are close to one another (100kb, based on LD plot), preferentially keeping the high-power microhaps. Export fastas
+```{r}
+
+# To do: select the highst-diversity microhaps in each LD block. export fastas, maybe 250bp from each window? have a list of the important SNPs but also the other SNPs in the window. Or, I can put in all the other SNPs when I am working with all loci, at the primer design stage. Can get rid of the lower stuff in this code block once I figure out my new fasta importing pipeline
+
+# import data
+allHapsout<-read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_haploScore.csv')
+positionData<-read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive.csv') %>% 
+  dplyr::select(microhap_name, chr, position=pos)
+
+# run a 100kbp window and group microhaps 
+window<-100*1000
+
+grouping<-left_join(positionData, allHapsout, by='microhap_name') %>% 
+  mutate(pos_ld=as.numeric(as.character(cut(position, breaks=seq(0,50*10^6,(window*2)), 
+                         labels=seq((window*2)/2,50*10^6-(window*2)/2,(window*2)))))) %>% 
+  mutate(chr_pos_ld=paste0(chr, '_',pos_ld))
+
+# Here, make a loop that keeps the microhap if there is only one locus in the 100kb section, but keeps the higher SW value if there are linked values
+grouping_cleaned<-tibble()
+for(i in unique(grouping$chr_pos_ld)){
+  grouping_looped<-filter(grouping, chr_pos_ld==i)
+  if(nrow(grouping_looped)==1){
+    grouping_cleaned<-bind_rows(grouping_cleaned, grouping_looped)
+  }
+  else{
+    grouping_looped_in<-grouping_looped %>% 
+      arrange(desc(SW_index)) %>% 
+      slice_head(n=1)
+    grouping_cleaned<-bind_rows(grouping_cleaned, grouping_looped_in)
+
+  }
+}
+
+# select for the highest number of haplotypes here, if desired. 
+ggplot(grouping_cleaned, aes(nhaps)) +
+  geom_histogram()
+
+write_csv(grouping_cleaned, '/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_haploScore_pruned.csv')
+nrow(grouping_cleaned)
+
+# import the previously generated fasta sequences and filter them for just these subsetted regions
+    
+    microhapsIn<-readDNAStringSet('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN.fasta')
+    
+    microhapsIn_filtered<-microhapsIn[grouping_cleaned$microhap_name]
+
+    writeXStringSet(microhapsIn_filtered, '/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_haploScore_pruned.fasta')
+    
+```
+
+### Use CKMR with the microhaplotypes to estimate the power of each microhaplotype
+
+Import the allele frequency data for each microhap and estimate the power of our marker set
+tutorial https://rdrr.io/github/eriqande/CKMRsim/f/vignettes/CKMRsim-example-1.Rmd
+If we have actual individual genotype calls for adults and juveniles, look at the tutorial
+The below is for estimated AF of each microhap
+```{r}
+# Installing
+    # library(devtools)
+    # devtools::install_github("eriqande/CKMRsim") # , force=T, build_vignettes = TRUE
+library(CKMRsim)
+
+# import AF for each microhap
+microhap<-read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_ckmrsiminput.csv')
+
+# count the total number of individuals which score for each microhap
+n_inds<-microhap %>% 
+  group_by(microhap_name) %>% 
+  summarise(n_ind=sum(n))
+
+# filter the microhap list for the ones that ended up in our panel (so far) and set things up in the way ckmrsim expects it
+alle_freqs<-read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_haploScore_pruned.csv') %>% 
+  dplyr::select(microhap_name, chr, position) %>% 
+  left_join(microhap, by='microhap_name') %>% 
+  left_join(n_inds, by='microhap_name') %>% 
+  mutate(af=n/n_ind) %>% 
+  dplyr::select(Chrom=chr, Pos=position, Locus=microhap_name, Allele=all, Freq=af) %>% 
+  arrange(Pos, desc(Freq)) %>%
+      mutate(AlleIdx = NA,
+             LocIdx = NA,
+             Pos=as.integer(Pos))
+
+# index the loci and alleles 
+afreqs_ready <- reindex_markers(alle_freqs)
+
+# Create a CKMR object using the above data
+  ex1_ckmr <- create_ckmr(
+    D = afreqs_ready, # indexed tibble of allele frequencies created above
+    kappa_matrix = kappas[c("PO", "FS", "HS", "U"), ], # the relationships we want to test for
+    ge_mod_assumed = ge_model_TGIE,
+    ge_mod_true = ge_model_TGIE,
+    ge_mod_assumed_pars_list = list(epsilon = 0.005),
+    ge_mod_true_pars_list = list(epsilon = 0.005)
+  )
+  
+# simulate genotype pairs and calculate their log-probabilities conditional on the pair being one of those relationships
+  ex1_Qs <- simulate_Qij(ex1_ckmr,  
+                     calc_relats = c("PO", "FS", "U"), # the set of true relationships you want to simulate genotypes from.
+                     sim_relats = c("PO", "FS", "HS", "U") ) # the set of assumed relationships you want to simulate genotypes from
+  
+# Compute log-likelihood ratios to view (optional but nice to visualize)
+  PO_U_logls <- extract_logls(ex1_Qs,
+                          numer = c(PO = 1), # This says we are interested in PO and U and we don't have any prior info about how many of each there are
+                          denom = c(U = 1)) # If we expected that 95% were U and 5% were PO, we would do PO=0.05 and U=0.95?
+  
+  # Visualize
+  ggplot(PO_U_logls,
+          aes(x = logl_ratio, fill = true_relat)) +
+    geom_density(alpha = 0.25)
+  
+  # Visualize, filtering for just PO and U
+  ggplot(PO_U_logls %>% filter(true_relat %in% c("PO", "U")),
+          aes(x = logl_ratio, fill = true_relat)) +
+    geom_density(alpha = 0.25)
+  
+  # Compute and visualize for FS vs U
+  FS_U_logls <- extract_logls(ex1_Qs,
+                          numer = c(FS = 1),
+                          denom = c(U = 1))
+
+  ggplot(FS_U_logls %>% filter(true_relat %in% c("FS", "U")),
+              aes(x = logl_ratio, fill = true_relat)) +
+    geom_density(alpha = 0.25)
+
+```
+
+
+### Depracated code
+```{r}
+
+        # snp_downsampled <- read_tsv('/workdir/smallmouth/angsd/bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_downsampled_250kb_0kbp_buffer_max10kb.txt', col_names = c('chr','position','maj','min')) # This is the LD-pruned dataset - we don't want to be LD-pruning
+        # 
+     
+    # Filter for SNPs that have at least one other SNP within the flanking region
+      # this commented out section was from when we were bringing in another list - no longer necessary. Just looking for SNPs that pass our maf filter
+        # # First, take the unpruned list, filter for refbias, see which are not fixed in LML (maf>0.005)
+        #     unpruned_refbias<-left_join(UnprunedSnpList, refBias, by=c('chr','position')) %>% 
+        #       filter(keep_ref==T) %>% 
+        #       dplyr::select(chr,position)
+        #     
+        #     tibOut<-tibble()
+        #     maf_filter<-0.05
+        #     for(i in c('A','D')){
+        #       pop_maf <- as_tibble(read.table(gzfile(paste0('/workdir/smallmouth/angsd/popminind20/', i, '_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.mafs.gz')), header = TRUE)) %>% 
+        #             rename(chr=chromo)
+        #       
+        #       tibIn<-left_join(unpruned_refbias, pop_maf, by=c('chr','position')) %>% 
+        #           filter(between(knownEM, maf_filter, (1-maf_filter))) %>% 
+        #           dplyr::select(c(chr,position, knownEM, nInd)) %>% 
+        #           mutate(pop=i)
+        #       
+        #       tibOut <- bind_rows(tibIn, tibOut)
+        # 
+        #     }
+            # 
+            # unpruned_refbias_maf<-tibOut %>% 
+            #   dplyr::select(c(chr, position,knownEM, pop)) %>% 
+            #   tidyr::pivot_wider(names_from = pop, values_from=knownEM) %>% 
+            #   filter(!is.na(A),  !is.na(D))
+      
+      # Check which SNPs have high information content - iterate through SNPs of interest
+      # microhap_out<-tibble()
+      #       for(i in 1:nrow(microhap)){
+      #         chr_target<-microhap[i,]$chr
+      #         pos_start_target<-microhap[i,]$pos_start
+      #         pos_end_target<-microhap[i,]$pos_end
+      #         count<-unpruned_refbias_maf %>%
+      #           filter(chr==chr_target, between(position, pos_start_target, pos_end_target)) %>%
+      #           nrow()
+      #         microhap_in<-tibble(chr=chr_target, position=microhap[i,]$position, snps_flanking=count)
+      #         microhap_out<-bind_rows(microhap_in, microhap_out)
+      #         if (i %% 100 == 0) {print(paste0(i,"/",nrow(microhap)))}
+      #       }
+
+
+# # Generate frequency counts (5 minutes)
+# /programs/windowmasker-1.0.0/windowmasker -in /workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta -mk_counts -out /workdir/smallmouth/genome/smb_anchored/smb_anchored.counts
+# 
+# # Mask the genome (took 7 minutes)
+# /programs/windowmasker-1.0.0/windowmasker -in /workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta -ustat /workdir/smallmouth/genome/smb_anchored/smb_anchored.counts -outfmt fasta -dust T -out /workdir/smallmouth/genome/smb_anchored/smb_anchored_masked.fasta
+
+# use awk to subset sequences
+# For each entry in preliminary panel above, subset the fasta and make a new fasta, labeling as parentage_[chr]_[startpos]
+    # subsetting fasta https://www.unix.com/shell-programming-and-scripting/158008-parsing-fasta-sequence-start-end-coordinates.html
+    
+    cd /workdir/smallmouth/gtseq/
+    
+    awk -v start=28469 -v end=28619 -v chr=NW_024040040.1_RagTag '$0~chr{getline seq; print substr(seq,start,end-start+1)}' /workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta > sequence_NW_024040040.1_RagTag_28469.txt
+
+# Use repeatmasker to remove loci in low complexity or repetitive regions. unfortunately repeatmasker requires repbase or we need to build a new library using repmodeler. NCBI has moved to windowmasker so I will too. WindowMasker doesn't mask known transposons like repeatMasker but it should be sufficient for detecting low-complexity or repetitive regions. Low-complexity regions contain lots of repeats
+# https://genomevolution.org/wiki/index.php/Genome_masking
+```
+
+## Adaptive loci
+
+pull the highest Fst SNPs, a few for each adaptive peak, or many for the LG19 block
+```{r}
+# import Fst between A & D, remove referece bias, do a window 
+fst<-read_tsv(paste0('/workdir/smallmouth/angsd/popminind20/A_D_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.fst'), col_names = c('chr', 'pos', 'alpha', 'beta', 'fst')) %>% 
+  left_join(read_tsv("/workdir/smallmouth/angsd/global_snp_list_depth_ratio_filtered.txt", col_names = c("chr", "pos",'refmaj','refmin')), by=c('chr','pos')) %>% 
+  filter(!is.na(refmaj)) %>% 
+  filter(!chr %in% chr_duplicated$non_anchored) %>%  # since we got chr's duplicated (weird) get rid of duplicates
+  left_join(lg_filter, by=c('chr'))
+
+# plot Fst
+fst %>% 
+  mutate(name=if_else(is.na(name), 50,name)) %>% 
+  ggplot(aes(pos/10^6, fst)) + 
+  scale_x_continuous(breaks=seq(0, 50, 5)) +
+  geom_point() +
+  facet_grid(.~name, scales='free_x', space='free_x') 
+  ggsave('/workdir/smallmouth/figures/fst_ad_norefbias.png', width = 18, height = 3)
+
+# plot window Fst
+window_length<-40*1000
+    fst_window <- mutate(fst, pos=cut(pos, breaks=seq(0,50*10^6,window_length), labels=seq(window_length/2,50*10^6-window_length/2,window_length))) %>%
+        group_by(chr, pos) %>%
+    summarise(fst_mean=sum(alpha)/sum(beta),
+              s2fst=var(fst, na.rm = T),
+              n = n()) %>% 
+    filter(n > 5) %>%  # Here, I can filter the windows for a minimum number of SNPs
+    mutate(pos=as.numeric(as.character(pos))) %>% 
+      left_join(lg_filter, by='chr')
+    
+    fst_window %>% 
+      filter(name==19 | name==6|name==7) %>% 
+      mutate(name=if_else(is.na(name), 50,name)) %>% 
+      ggplot(aes(pos/10^6, fst_mean)) + 
+          scale_x_continuous(breaks=seq(0, 50, 5)) +
+          geom_point() +
+          facet_grid(.~name, scales='free_x', space='free_x')
+        ggsave('/workdir/smallmouth/figures/fst_ad_window_norefbias.png', width = 18, height = 3)
+
+# Filter Fst plot for chunks of high divergence
+  outlier<-tibble(name=c(6,7,19),
+                  start=c(2.5e06, 23e06, 11e06),
+                  end=c(5e06, 27e06, 27e06))
+
+# We get three GWAS hits in these regions of high divergence - they are all on LG19
+  adaptive_loci<-read_tsv('/workdir/smallmouth/gwas/significant_hits_ADF_anomaly_allages.tsv') %>% 
+    filter(name==outlier[1,]$name & between(pos, outlier[1,]$start, outlier[1,]$end) |
+           name==outlier[2,]$name & between(pos, outlier[2,]$start, outlier[2,]$end) |
+           name==outlier[3,]$name & between(pos, outlier[3,]$start, outlier[3,]$end) ) %>% 
+    dplyr::select(name, pos) %>% 
+    mutate(microhap_name=paste0('adaptive_gwas_lg',name,'_',pos))
+    
+# LG19 (n=30)
+  # take the top Fst SNP for every 1mb (excluding a few outside the Fst block)
+    fst_19_out<-tibble()
+    for(i in c(1,4,6,9,11,13,15,17:25,27,29,30,34,36)){
+      fst_19_in<-filter(fst, name==19, between(pos,(i-1)*1e06,i*1e06)) %>% 
+        arrange(desc(fst)) %>% 
+        slice_head(n=1)
+      fst_19_out<-bind_rows(fst_19_in, fst_19_out)
+    }
+    
+    # add a few more in the low tajD region, (1.97-2.11)
+    fst_lowtajD_out<-tibble()
+    for(i in seq(0,14,2)){
+      fst_19_in<-filter(fst, name==19, between(pos,(1.97e07+(i)*1e05), (1.97e07+((i+2)*1e05)))) %>% 
+        arrange(desc(fst)) %>% 
+        slice_head(n=1)
+      fst_lowtajD_out<-bind_rows(fst_lowtajD_out,fst_19_in)
+    }
+    
+# LG6 chunk (n=5), 2.5-4.5
+    lg6_out<-tibble()
+    for(i in seq(1.5,5,0.5)){
+      lg_in<-filter(fst, name==6, between(pos, i*1e06, (i+0.5)*1e06)) %>% 
+        arrange(desc(fst)) %>% 
+        slice_head(n=1)
+      lg6_out<-bind_rows(lg6_out, lg_in)
+    }
+
+# LG7 chunk (n=5)
+    lg7_out<-tibble()
+    for(i in seq(22.5,26.5,0.5)){
+      lg_in<-filter(fst, name==7, between(pos, i*1e06, (i+0.5)*1e06)) %>% 
+        arrange(desc(fst)) %>% 
+        slice_head(n=1)
+      lg7_out<-bind_rows(lg7_out, lg_in)
+    }
+    
+# bind all and check for even-ish distribution
+
+    fst_all<-fst_19_out %>% 
+      bind_rows(fst_lowtajD_out, lg6_out, lg7_out) %>% 
+      dplyr::select(name, pos) %>% 
+      mutate(microhap_name=paste0('adaptive_lg',name,'_',pos)) %>% 
+      bind_rows(adaptive_loci)
+    
+    left_join(fst, fst_all, by=c('name','pos')) %>% 
+      mutate(chosen=as.character(if_else(is.na(microhap_name),0.1,1))) %>% 
+      filter(name==19 | name==6 | name==7) %>% 
+      ggplot(aes(pos, fst)) +
+      geom_point(aes(color=chosen, size=chosen, alpha=chosen)) +
+      facet_grid(~name)
+    ggsave('/workdir/smallmouth/figures/adaptive_choices_out.png',height=4, width=15)
+        
+
+# Retrieve the fastas around the region (250bp either side)
+    
+    fst_all %>% 
+      write_csv('/workdir/smallmouth/gtseq/adaptive_loci.csv')
+```
+
+## pop STRUCTURE across LML
+
+Enrich for a few very high allele count microhaps just in popD
+```{r}
+maf_filter<-0.005 # exclude fixed loci
+window<-125 # Check how many SNPs there are within this window
+
+
+  as_tibble(read.table(gzfile(paste0('/workdir/smallmouth/angsd/popminind20/D_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.mafs.gz')), header = TRUE)) %>% 
+  filter(between(knownEM, maf_filter, (1-maf_filter))) %>% 
+  mutate(pos=as.numeric(as.character(cut(position, breaks=seq(0,50*10^6,(window*2)), 
+                 labels=seq((window*2)/2,50*10^6-(window*2)/2,(window*2)))))) %>% 
+  group_by(chr=chromo, pos) %>%
+  summarise(n = n()) %>% 
+  filter(between(n,10,17)) %>%  # Some of these microhaps have lots of loci!
+  left_join(lg_filter, by='chr')
+  
+# Next steps are to only select the high-maf and high-n microhaps, and add just a few of them to the list. These should be useful for the parentage stuff as well. Essentially we are just using these like microsats
+  # I could also extract individual genotypes for these individuals to make sure that individuals show different genotypes, but this is kinda sketchy---maf should take care of it
+
+# Run PCangsd on our markers
+
+```
+## sex determining region
+
+LMB are xy (2022 aquaculture paper), where females are homozygous (no deletions) and males are heterozygous (deletion on one of the pair but not on the other)
+Fish rarely have sex chromosomes
+Sex determination temp can overrule genes. presence of sex determination gene results in male, for XY, or female, for ZW
+
+### SMB Fst in this LMB sex determination region 
+
+Fst of 0.5 means it is a sex determination SNP - the genotype should be homozygous for the homogametic sex and heterosygous for the heterogametic sex. 
+```{r}
+# Individual plotting - male vs female
+lg_filter_temp <- dplyr::rename(lg_filter, LG = lg, lg = chr)
+           fst <- read_tsv('/workdir/smallmouth/angsd/popminind16/Female_Male_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind16.fst', col_names = c('lg', 'pos', 'alpha', 'beta', 'fst')) %>%
+       left_join(lg_filter_temp, by = 'lg')
+
+      fst %>% 
+        filter(lg=='NW_024040041.1_RagTag', between(pos,3.14e07,3.31e07)) %>% 
+        ggplot(aes(pos, fst)) +
+        geom_point(size=0.5, alpha=0.5) +
+        geom_vline(xintercept = 31995890) +
+        geom_vline(xintercept = 32010152) +
+        ggtitle('Fst outliers in the neighborhood of the LMB sex determination region')
+
+      fst %>% 
+        filter(!is.na(name)) %>% 
+        ggplot(aes(pos, fst)) +
+        geom_point() +
+        facet_grid(~name)
+
+     fst %>%
+       filter(fst>0.4,!duplicated(fst)) %>% 
+       mutate(microhap_name=paste0('sex_fst_',lg,'_', pos)) %>% 
+       dplyr::select(microhap_name, chr=lg, pos) %>% 
+       write_csv('/workdir/smallmouth/gtseq/sex_determination_fst.csv')
+```
+
+Check individual read depth in the same region as LMB for male and female
+exclue high-outlier regions (TEs)
+Look for where males have half the read depth of females, or vice-versa
+
+### Import the places where males map and females don't (and vice versa)
+
+Design some primers around these regions
+```{r}
+read_tsv('/workdir/smallmouth/angsd/sex_panel_read_depth.tsv') %>% 
+  filter(between(length_indel,20,41)) %>% 
+  mutate(microhap_name = paste0('sex_read_depth_',chr, '_start',pos_start,'_end',pos_end),
+         pos=round((pos_start+pos_end)/2),0) %>% 
+  dplyr::select(microhap_name, chr, pos, pos_start, pos_end) %>% 
+  bind_rows(read_csv('/workdir/smallmouth/gtseq/sex_determination_fst.csv')) %>% 
+  write_csv('/workdir/smallmouth/gtseq/sex_determination_regions.csv')
+```
+
+Double-check these regions
+
+### validate my read deth approach with jellyfish
+Break genome in short (31bp is standard) fragments (mers) and then look at read depth across these, for males and females
+

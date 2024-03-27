@@ -1,0 +1,774 @@
+# import R libraries and some data
+
+```{r}
+library(tidyverse)
+library(poppr)
+library(readxl)
+
+#Bring in a tibble of all amplicon info
+# read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget_pool10_easy_names.csv') %>% mutate(ID = str_sub(ID,1,nchar(ID)-2)) %>%
+#   dplyr::select(num, ID, FullSeq, side) %>%
+#   pivot_wider(names_from = c(side), values_from = FullSeq) %>%
+#   separate(ID, into = c('microhap_name','primer_n'), sep = '_primer') %>%
+#   left_join(read_csv('/workdir/smallmouth/gtseq/adaptive_parentage_primer3_regions.csv'), by = 'microhap_name') %>%
+#   left_join(read_csv('/workdir/smallmouth/gtseq/adaptive_parentage_sex_fasta.csv'), by = 'microhap_name') %>%
+#   left_join(dplyr::select(read_csv('/workdir/smallmouth/sample_lists/lg_reference_annotate.csv'), chr, chrNum=name), by = 'chr') %>%
+#   mutate(locusE=paste0(chrNum,'-',num)) %>%
+#   write_csv('/workdir/smallmouth/gtseq/all_regions_primers_ordered.csv')
+ordered_amplicons<-read_csv('/workdir/smallmouth/gtseq/all_regions_primers_ordered.csv')
+
+# import allFish
+allFish<- read_csv('/workdir/smallmouth/ecological/allFish.csv.gz')
+
+# Import a separate tibble which has the coordinates of LML edge
+lake_edge<-read_csv('/workdir/smallmouth/ecological/Location_LML_05-22.csv', skip=4)
+
+# import snorkel data from 2021 and 2022
+snorkel<-googlesheets4::read_sheet('https://docs.google.com/spreadsheets/d/1CJVikWmzlmv0qOtG2X1iLUyslgiJ-4vmgUSnjVO_NcU/edit#gid=0', )
+
+# read in which primers were excluded for each round
+primers_excluded<-read_tsv('/workdir/smallmouth/gtseq/sequencing/primer_exlucsion_pool.tsv')
+
+# My imported funciton to say not in
+`%nin%` = Negate(`%in%`)
+```
+
+# generate tsv to identify problem dimers (don't need to do this after its been done once)
+
+We need to give it a tsv of LocusName\tFWD-Primer sequence\tREV-Primer sequence\
+
+```{r}
+allprimers<-read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget_pool10_easy_names.csv') %>% 
+  mutate(primerblast_check=str_replace(FullSeq, 'CTACACGTTCAGAGTTCTACAGTCCGACGATC',''),
+         primerblast_check=str_replace(primerblast_check, 'GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCT','')) %>% 
+  dplyr::select(num, side, primerblast_check) %>% 
+  pivot_wider(names_from=side, values_from = primerblast_check)
+
+
+  write_tsv(allprimers, '/workdir/smallmouth/gtseq/genotyping/primerdimer_check.tsv')
+  write_csv(dplyr::select(allprimers, -R), '/workdir/smallmouth/gtseq/genotyping/primerdimer_check.csv') # this doesn't seem to work, I think I need the probe sequences too
+  write_tsv(allprimers, '/workdir/smallmouth/gtseq/genotyping/primerdimer_check_noheaders.tsv', col_names = NA)
+```
+
+# Panel optimization 
+https://github.com/GTseq/GTseek_utils.git
+Downloaded zip and uploaded into gtseq/GTseek_utils-Main
+
+Readme is README_GTseek_MultiPCR-Analysis.txt
+Also, https://github.com/GTseq/GTseq-Pipeline
+
+Notes
+how to deal with PE data where most of the sequencing runs ran off the end of the fragment (ie too short)
+Should have run 2x75 for the first run
+
+The failed MiSeq run is in /workdir/backup/smallmouth/gteq_optimization_1/gtseq_optimization_1/13494_11855_169993_GD75N_R1.fastq.gz
+
+Before getting going: To make the sample table - go to Nate's excel file that generates the indexes, and paste (values only) into a new csv (only needed for demultiplexing)
+
+## a small detour - group the demultiplexed fastqs into moderate-concentration (>10ng/uL) and high-conc (>20ng/uL)
+
+```{r}
+# this is from the count reads section below
+all_reads %>% 
+  filter(Conc > 20) %>% 
+  mutate(R1 = str_replace(original_file, '.gz-merged.fastq', '.fastq.gz'),
+         R2 = str_replace(R1, 'R1', 'R2')) %>% 
+  dplyr::select(GENID, R1, R2) %>% 
+  pivot_longer(-GENID, names_to = 'direction', values_to = 'file') %>% 
+  dplyr::select(file) %>% 
+  write_tsv('/workdir/smallmouth/gtseq/GTscore-materials/optimization_8_fastq_greater_than_20.tsv', col_names = F)
+```
+
+now make some new directories of moderate and high conc-libraries
+```{bash}
+cd /workdir/backup/smallmouth/gtseq_optimization_8_pe150/brc_sorted
+mkdir moderate_conc
+for i in `cat /workdir/smallmouth/gtseq/GTscore-materials/optimization_8_fastq_greater_than_10.tsv`; do
+cp $i moderate_conc/
+done
+
+mkdir high_conc
+for i in `cat /workdir/smallmouth/gtseq/GTscore-materials/optimization_8_fastq_greater_than_20.tsv`; do
+cp $i high_conc/
+done
+
+# cd into each one and run through the below bash pipeline
+
+```
+
+## run through the generation of dimer-detection software
+
+```{bash}
+# Download data
+    
+    cd /workdir/backup/smallmouth/gtseq_optimization_1_pe75/brc_sorted # this is the folder that the brc demultiplexed
+    cd /workdir/backup/smallmouth/gtseq_optimization_6_pe150/brc_sorted # this is the folder that the brc demultiplexed
+    
+    sh ./download.sh # run this in both
+    
+# combine the R2 and R1 and move them to nate's script folder
+
+    zcat *R2.fastq* > combined_R2.fastq
+    zcat *R1.fastq* > combined_R1.fastq
+    
+    mv combined_*.fastq ../nate_sorted
+
+# Get the percentage of total reads, on-target reads, and the percent of correctly  scoring reads for each individual
+    # I was having trouble running GTseq_PrimerAnalysis.pl because conda was starting instead of perl. To change this, see Qi Sun's email from 1/5/23. I changed the file /home/ljz27/.bashrc to do the following:
+    # 1) add a line "return" right before "# >>> conda initialize >>>"
+    # 2) Modify the line PERL5LIB. With your current setting, all PERL modules installed on BioHPC will not be accessible. change to:
+    # PERL5LIB="/home/ljz27/perl5/lib/perl5${PERL5LIB:+:${PERL5LIB}}:$PERL5LIB"; export PERL5LIB;
+
+# get on-target percentage for each locus and each individual. run this from brc_sorted
+    bash /workdir/smallmouth/gtseq/genotyping/count_reads_ontarget_loci.sh # this didn't get the same result as GTscore counted reads, so assuming mine is wrong
+    cat primeranalysis.txt 
+
+
+# combine the forwrad and reverse reads. paste seqs reverse complements the R2 and paste it onto the R1. doesn't align the sequences
+    cd ../nate_sorted/
+    perl /workdir/smallmouth/gtseq/GTseek_utils-Main/paste_fastq.pl combined_R1.fastq combined_R2.fastq > combined_R1_R2.fastq
+
+# get the actual number of F and R primers for each locus (does not need to be adapter clipped)
+    perl /workdir/smallmouth/gtseq/GTseek_utils-Main/GTseq_PrimerTest_NoProbe.pl /workdir/smallmouth/gtseq/genotyping/primerdimer_check_noheaders.tsv combined_R1.fastq combined_R2.fastq > combined_R1_R2_primertest.tsv
+
+# look for primer dimers
+    perl /workdir/smallmouth/gtseq/GTseek_utils-Main/HashSeqs.pl combined_R1_R2.fastq > combined_R1_R2.fastq.hash
+    
+    perl /workdir/smallmouth/gtseq/GTseek_utils-Main/GTseq_Primer-Interaction-Test_v3.pl /workdir/smallmouth/gtseq/genotyping/primerdimer_check.tsv combined_R1_R2.fastq.hash > combined_R1_R2.fastq.hash.primer_interaction
+    
+    grep -A20 '[Pp]rimer\|[Bb]lack' combined_R1_R2.fastq.hash.primer_interaction > combined_R1_R2.fastq.hash.primer_interaction_truncated.txt
+    
+# copy the combined R1 and R2 to the gtscore directory to demultiplex and get read count
+    
+    # flash the R1 and R2 files (min overlap is 10, max overlap is 65% of read length, so 100bp)
+    cd /workdir/backup/smallmouth/gtseq_optimization_8_pe150/gtscore_sorted
+    export PATH=/workdir/smallmouth/software/FLASH2:$PATH
+    flash2 combined_R1.fastq combined_R2.fastq -m 10 -M 200 -o flashed
+    mkdir demultiplex
+    cp flashed.extendedFrags.fastq demultiplex/
+    
+    # make sure to upload the demultiplexing txt file from the BRC (add to the top line: Sample ID I7_barcode  I5_barcode)
+    perl /workdir/smallmouth/gtseq/GTscore/DemultiplexGTseq.pl -b /workdir/smallmouth/gtseq/GTscore-materials/brc_demultiplex_gtseq_optimize_8_1-31-23.txt -s flashed.extendedFrags.fastq
+    
+```
+
+Here's the short version of all of the above
+```{bash}
+perl /workdir/smallmouth/gtseq/GTseek_utils-Main/paste_fastq.pl combined_R1.fastq combined_R2.fastq > combined_R1_R2.fastq
+perl /workdir/smallmouth/gtseq/GTseek_utils-Main/GTseq_PrimerTest_NoProbe.pl /workdir/smallmouth/gtseq/genotyping/primerdimer_check_noheaders.tsv combined_R1.fastq combined_R2.fastq > combined_R1_R2_primertest.tsv
+perl /workdir/smallmouth/gtseq/GTseek_utils-Main/HashSeqs.pl combined_R1_R2.fastq > combined_R1_R2.fastq.hash
+perl /workdir/smallmouth/gtseq/GTseek_utils-Main/GTseq_Primer-Interaction-Test_v3.pl /workdir/smallmouth/gtseq/genotyping/primerdimer_check.tsv combined_R1_R2.fastq.hash > combined_R1_R2.fastq.hash.primer_interaction
+grep -A20 '[Pp]rimer\|[Bb]lack' combined_R1_R2.fastq.hash.primer_interaction > combined_R1_R2.fastq.hash.primer_interaction_truncated.txt
+rm combined_R1_R2.fastq.hash.primer_interaction
+```
+
+## Dianas approach to finding a list of naughty loci
+
+We are shooting for greater than 50% of the reads being proper on-target primer combinations
+
+XXXXXXXXXXXXXXX    HOW TO USE THE BELOW SCRIPT = MAKE A LIST OF ALL OF THE INTERACTING PRIMERS IDENTIFIED BY NATE'S PRIMERINTERACTION SCRIPT
+DON'T NEED TO GO THROUGH IT YET
+THEN TAKE THE RESULTS FROM NATE'S PRIMERTEST SCRIPT, WHICH COUNTS THE OCCURRENCE OF ALL FWD AND REV PRIMERS
+IDENTIFY ALL THE OUTLIERS IN FWD OR PAIRED PRIMERS AND MAKE A LIST OF THESE GUYS (graphing PAIRED x FWD)
+However, graphing only really will work once we have the proper paired-end data...the paired percentage works 
+
+GO THROUGH THIS LIST AND EXCLUDE ANY WHERE BOTH PAIRS SHOW UP IN THE PRIMERINTERACTION SCRIPT, LEAVING US JUST WITH THE MYSTERIOUS OVERAMPLIFIERS
+DECIDE WHICH OF THE PAIRS OF PRIMER TO EXCLUE DETERMINED BY THE PRIMERINTERACTION SCRIPT, THEN COMBINE THIS IWTH THE MYSTERIOUS OVERAMPLIFIERS
+THIS IS OUR FINAL LIST TO EXCLUDE - GO THROUGH AND CHECK IF ANY HAVE REALLY HIGH ON-TARGET PERCENTAGE AND MAYBE RETHINK EXCLUDING THEM
+
+read in the data
+```{r}
+# EDIT THESE FOR EACH ROUND
+  round<-6
+
+  if(round>5) length<-150 else length<-75
+  
+  primers_excluxed_filtered<-filter(primers_excluded, round_seq <= round)
+  
+  primertest<-read_tsv(paste0('/workdir/backup/smallmouth/gtseq_optimization_',round,'_pe',length,'/nate_sorted/combined_R1_R2_primertest.tsv')) %>%
+    anti_join(primers_excluxed_filtered, by = 'LocusID') %>% 
+    mutate(paired_percent = PAIRED/FWD)
+  
+  
+```
+  
+Round 1 (for this I think it actually works best to calculate the sd and median of outliers on F, R, or PAIRED and filter them out by that)
+```{r}
+primertest_pivot<-dplyr::select(primertest, -PAIRED_PERCENTAGE) %>% 
+    pivot_longer(-LocusID, names_to = 'value', values_to = 'num')
+
+  sums<-group_by(primertest_pivot, value) %>% 
+    summarise(medianval = median(num),
+              sdval = sd(num),
+              sumval = sum(num))
+
+  primertest_pivot_round1<-left_join(primertest_pivot, sums, by = 'value') %>% 
+    mutate(sd_from_med = (num-medianval)/sdval,
+           percent_of_all = num/sumval) %>% 
+    dplyr::select(LocusID, value, sd_from_med, percent_of_all) %>% 
+    pivot_wider(names_from = value, values_from = c(sd_from_med, percent_of_all)) %>% 
+    mutate(sd_max = pmax(sd_from_med_FWD, sd_from_med_REV),
+           percent_max = pmax(percent_of_all_FWD, percent_of_all_REV, percent_of_all_PAIRED)) %>% 
+  filter(percent_max < 0.005)
+  
+  # Use this to iteratively knock down the percent max, then do the sd_max as well. take it so it looks like a normal-ish poisson curve
+      # ggplot(primertest_pivot_round1, aes(percent_max)) +
+      # geom_histogram()
+      
+      anti_join(primertest, primertest_pivot_round1, by = 'LocusID') %>% dplyr::select(LocusID)
+
+  # round 1, Diana's method
+  
+  primertest %>% 
+      ggplot(aes(PAIRED,FWD, label = LocusID, color = paired_percent)) +
+      geom_text(hjust=0, vjust=0) +
+          geom_abline(linetype = 'dotted')
+  ggsave(paste0('/workdir/smallmouth/gtseq/results/dimer-detection-round',round,'.png'),height=4,width=6)
+  
+  primertest_round1_keep<-primertest %>% 
+    filter(PAIRED < 300, FWD < 3000)
+  
+    ggplot(primertest_round1_keep, aes(PAIRED,FWD, label = LocusID, color = paired_percent)) +
+    geom_text(hjust=0, vjust=0) +
+          geom_abline(linetype = 'dotted')
+    
+  anti_join(primertest, primertest_round1_keep, by = 'LocusID') %>% dplyr::select(LocusID)
+```
+
+I can do round 3 Diana's method here just to see how things look like they're working
+  
+But now I'm at round 6
+```{r}  
+    # Take each window and calculate the number of loci dropped
+    # Can take loci on the 1:1 line and adjust conc if too high (or double conc of primers that are too low)
+    
+      primertest_filt<-primertest %>% 
+      filter(FWD < 10000, PAIRED < 9000) %>% 
+      filter(FWD < 2700 & PAIRED < 2000 | paired_percent > 0.7 & PAIRED > 2000)
+            
+      ggplot(primertest_filt,aes(FWD,PAIRED, label = LocusID, color = paired_percent)) +
+      geom_text(hjust=0, vjust=0) +
+          geom_abline(linetype = 'dotted')
+
+    # Now that we have a reduced set do the same with the REV file
+      primertest_filt_rev<-primertest_filt %>% 
+        mutate(paired_percent_rev = PAIRED / REV) %>% 
+        filter(REV < 8000)
+        #filter(REV < 3000 & PAIRED < 2000 | PAIRED > 2000 & REV < 7750 | LocusID == 188) # gotta keep in the sex fst one
+      
+        ggplot(primertest_filt_rev,aes(PAIRED, REV, color = paired_percent_rev, label = LocusID)) +
+              geom_text(hjust=0, vjust=0) +
+                geom_abline(linetype = 'dotted')
+
+    # Look at what primers are excluded by FWD analysis but not REV
+        anti_join(primertest_filt, primertest_filt_rev) %>% 
+          mutate(paired_rev = PAIRED/REV)
+        
+        
+    # See what we have
+        bind_rows(primertest_filt_rev) %>% 
+        left_join(rename(ordered_amplicons, LocusID = num), by = 'LocusID') %>% 
+        left_join(read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_haploScore.csv'), by = 'microhap_name') %>% 
+        dplyr::select(microhap_name, SW_index, nhaps) %>% 
+        arrange(microhap_name)
+      
+    # Make a list to export to my excel spreadsheet
+      anti_join(primertest, primertest_filt_rev, by = 'LocusID') %>% 
+        dplyr::select(LocusID) %>% 
+        arrange(LocusID) %>% 
+        write_csv('/workdir/smallmouth/gtseq/genotyping/excluded_primers_from_optimization_6.tsv')
+      
+
+```
+
+Round 8
+```{r}
+  primertest<-read_tsv(paste0('/workdir/backup/smallmouth/gtseq_optimization_8_pe150/brc_sorted/moderate_conc/combined_R1_R2_primertest.tsv')) %>%
+    mutate(paired_percent = PAIRED/((FWD+REV)/2),
+           percent_all_reads = round((FWD+REV)/(sum(FWD)+sum(REV)),3)*100) %>% 
+  filter(paired_percent < 1.01)  # this should get rid of primers excluded in previous rounds
+
+  primertest %>% 
+     # filter(FWD < 35000) %>% 
+      ggplot(aes(PAIRED,FWD, label = LocusID, color = paired_percent)) +
+      geom_text(hjust=0, vjust=0) +
+          geom_abline(linetype = 'dotted')
+
+  primertest %>% 
+      #filter(REV < 31000) %>% 
+      ggplot(aes(PAIRED,REV, label = LocusID, color = paired_percent)) +
+      geom_text(hjust=0, vjust=0) +
+          geom_abline(linetype = 'dotted')
+  
+  primertest_keep_round8<-primertest %>% 
+      filter(FWD < 35000) #    & REV < 31000
+
+  # moderate conc, FWD < 35000 & REV < 30000. 
+    loci_to_remove<-anti_join(primertest,primertest_keep_round8, by = 'LocusID') %>% 
+      filter(paired_percent < 0.20 | percent_all_reads > 2.6)
+    
+    
+    # for round one and later rounds, just get rid of FWD/PAIRED baddies. For intermediate rounds, good at least to check the REV / PAIRED to see if there are any that stick around from round to roun (REV/REV dimers)
+    
+    anti_join(primertest, loci_to_remove) %>% 
+      ggplot(aes(PAIRED,FWD, label = LocusID, color = paired_percent)) +
+      geom_text(hjust=0, vjust=0) +
+          geom_abline(linetype = 'dotted')
+    
+    anti_join(primertest, loci_to_remove) %>% 
+      ggplot(aes(PAIRED,REV, label = LocusID, color = paired_percent)) +
+      geom_text(hjust=0, vjust=0) +
+          geom_abline(linetype = 'dotted')
+    
+    ggplot(primertest, aes(percent_all_reads)) +geom_histogram()
+
+```
+
+production 1
+```{r}
+  read_tsv('/workdir/backup/smallmouth/gtseq_production_1/combined_R1_R2_primertest.tsv') %>%
+    mutate(paired_percent = PAIRED/((FWD+REV)/2),
+           percent_all_reads = round((FWD+REV)/(sum(FWD)+sum(REV)),3)*100) %>% 
+  filter(paired_percent < 1.01) %>%   # this should get rid of primers excluded in previous rounds
+ # filter(FWD < 35000) %>% 
+  ggplot(aes(PAIRED,FWD, label = LocusID, color = paired_percent)) +
+  geom_text(hjust=0, vjust=0) +
+      geom_abline(linetype = 'dotted')
+```
+
+## combine nate and dianas approaches to decie which loci to exclude
+Nate says the following on excluding loci:
+Exclude any loci that are more than 1% of the total raw reads
+Combining results for paired reads, R1, and R2 (but this is all black reads)
+Also, Exclue the loci that are overrepresented in the Proper On-target primer combinatsions. some sort of repeat
+
+For the primer-test, export this into the excel spreadsheet (adk_genetics_primertest_output)
+Pulling anything greater than 5% of the F or the R reads for round 1, then 10% for rounds after
+
+Round 1 
+
+    From this, I'll exclude:
+    10 (lg19) by keep 181, 45, 73
+    75 (8 haps) but keep 175 (10 haps)
+    76 (7 haps) but keep 30 (lg6)
+    95 (4 haps) by keep 44 (12 haps)
+    89 (8 haps) but keep 15 (lg19)
+    174 (11 haps) but keep 13 (lg19)
+    152 (11 haps) but keep 83 (11 haps)
+  
+    From this first round of optimization, I will exclude:
+      191, 130, 10, 75, 76, 95, 89, 174, 152
+  
+  
+From the 2nd round of optimization, I will exclude:  (although I didn't, because I had messed up my bead ratios)
+  78 or 68
+  138 or 105
+
+From the 3rd round of optimization, I will exclude one or the other:
+  18 (lg19) or 181 (16nhaps)
+  34 (lg7) or 9 (lg19)
+  43 (11nhaps) or 50 (4 nhaps)
+  39 (lg7) or 73 (18 nhaps)
+  163 (13 nhaps) or 181 (16 nhaps)
+  46 (14 nhaps) or 166 (10 nhaps)
+  114 (12 nhaps) or 166 (10 nhaps)
+  
+  exclude: 181, 34, 50, 73, 166
+  
+Round 4 of optimization, I will exclude:
+  From primer-test (anything greater than 10% of reads)
+    106, 135, 41, 46
+
+  primer-interaction
+    93 (accounts for all the other issues)
+    
+From the 6th round on - I made an excel sheet in the BRC results folder on my dropbox, easier to consolidate there
+
+Round 8 of optimization, can exclude (I just went with excluding above high concentration, unless the BRC shows that the chelex extract didn't work)
+
+  ALL CONC
+  103, 107, 11, 54, 60, 85, 83
+  12 OR 150
+  149 OR 179
+  1 OR 52
+  160 OR 152
+  26 OR 107
+  
+  MODERATE CONC (>10)
+  103,107,54,60,85,83
+  1 or 52 (1 is gwas, so take out 52 (10 nhaps))
+  160 (13 nhaps) or 152 (10 nhaps)
+  26 (alaptive lg6) or 107 (17 nhaps)
+  12 (adaptive lg19) or 150 ( 7 nhaps)
+  149 (9 nhaps) or 179 (10 nhaps)
+  
+  loci to exclude for moderate concentration: 103, 54, 60, 85, 83, 52, 152, 150, 149
+  
+  HIGH CONC (>20)
+  103, 107, 54, 11,83
+  1 or 52 (1 is gwas, so take out 52 (10 nhaps))
+  160 (13 nhaps) or 152 (10 nhaps)
+  12 (adaptive lg19) or 150 ( 7 nhaps)
+  149 (9 nhaps) or 179 (10 nhaps)
+  
+  loci to exclude for moderate concentration:   103, 107, 54, 11,83, 52, 152, 150, 149
+
+  
+
+
+```{r}
+### HERE IS WHERE I CAN PLUG IN THE PRIMERS I NEED TO CHOOSE BETWEEN - EXCLUDE THE ONES THAT ARE LESS INFORMATIVE  ###
+  
+  baddies<-tibble(num = c(103, 54, 60, 85, 83, 52, 152, 150, 149), bad = T)
+
+
+loci_to_remove_REV
+
+read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget_pool10_easy_names.csv') %>% 
+  #left_join(baddies, by = 'num') %>% 
+  right_join(rename(loci_to_remove_REV,  num = LocusID), by = 'num') %>% 
+  #filter(bad==T) %>% 
+  dplyr::select(num, ID) %>% 
+  separate(ID, into = c('microhap_name', 'direction'), sep = '_primer') %>% 
+  left_join(read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_haploScore.csv'), by = 'microhap_name') %>% 
+  dplyr::select(-direction) %>% 
+  group_by(num) %>% 
+  summarise(microhap_name = unique(microhap_name),
+            SW_index = unique(SW_index),
+            nhaps = unique(nhaps))
+
+# FINALLY, TAKE THE LIST OF PRIMERS TO EXCLUDE AND PLOP THEM IN HERE, CHECKING ON-TARGET PERCENTAGE. check that the round is set correctly
+tibble(LocusID = c(103, 107, 11, 54, 60, 85, 83, 12, 150, 149, 179, 1, 52, 160, 152, 26)) %>% 
+  left_join(primertest, by = 'LocusID') %>% 
+  mutate(percent = as.double(str_replace(PAIRED_PERCENTAGE, '%', '')),
+         num=LocusID) %>% 
+  filter(percent > 50) %>% 
+  left_join(ordered_amplicons, by = 'num') %>% 
+  mutate(`F` = str_replace(`F`, 'CTACACGTTCAGAGTTCTACAGTCCGACGATC', ''),
+         R = str_replace(R, 'GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCT', '')) %>% 
+  dplyr::select(num, `F`, R)
+
+# 13 maps to 1 locations, 32 maps to 1 locations, 190 maps to 1 locations (if not allowing mismatches)
+```
+
+
+# call genotypes and plug them in amplicon.py OR microhaplot
+Documentation in github, GTscoreDocumentation V1.3.docx
+Cloned the github git clone https://github.com/gjmckinney/GTscore.git into my gtseq folder
+
+To make sample table - take demultiplexing file and upload it into the GTscsore-materials folder with a header of Sample ID   I7_barcode    I5_barcode
+
+### amplicon reference genome
+
+make a fasta of each reference sequence, excluding the loci we aren't sequencing anymore
+```{r}
+library(seqinr)
+ordered_amplicons_filt<-anti_join(ordered_amplicons, read_tsv('/workdir/smallmouth/gtseq/sequencing/Primers_excluded.txt'))
+
+# write full microhap sequence fasta, including primers on either end
+write.fasta(sequences = as.list(ordered_amplicons_filt$microhap_sequence), names = as.list(ordered_amplicons_filt$microhap_name), file.out = '/workdir/smallmouth/gtseq/amplicon_ref_genome/amplicon_reference.fasta')
+
+# write fasta sequence between each primer
+
+```
+
+install software and index reference genome (don't need to do after its been done once)
+```{bash}
+# First, install software to flash the files
+ cd /workdir/smallmouth/software/
+git clone https://github.com/dstreett/FLASH2.git
+cd FLASH2
+make
+export PATH=/workdir/smallmouth/software/FLASH2:$PATH
+
+# index reference genome (5-10 min)
+cd /workdir/smallmouth/gtseq/amplicon_ref_genome
+/programs/bwa-mem2-2.2.1/bwa-mem2 index amplicon_reference.fasta 
+/programs/samtools-1.15.1-r/bin/samtools faidx amplicon_reference.fasta
+```
+
+### Run amplicon.py
+
+Make sample table, key, and calculate desired maf
+```{r}
+# sample table has 1)Sample Name; 2) another unique string 3) Paired-end sequence file 1 (fastq or fastq.gz); 4) Paired-end sequence file 2
+# Just do this on the parentage and sex alleles
+as_tibble(list.files(path = '/workdir/backup/smallmouth/gtseq_production_2', pattern = '.gz')) %>% 
+  mutate(GENID = str_sub(value, start = 30, end = -27),
+         run = if_else(str_detect(value, '13917'), 1, 
+                       if_else(str_detect(value, '14057'), 2, NA_real_)),
+         GENID_duplicate = paste0('gtseq_production_',run,'--',GENID), # This is important... use a '--' rather than a '__', as the '__' is how amplicon.py separates name from copy
+         end = str_sub(value, start = -11, end = -10)) %>% 
+  dplyr::select(value, end, GENID_duplicate) %>% filter(value != 'flashed.extendedFrags.fastq.gz') %>%
+  pivot_wider(names_from=end, values_from=value) %>% 
+  mutate(GENID_duplicate_copy=GENID_duplicate) %>% dplyr::select(GENID_duplicate, GENID_duplicate_copy, R1, R2) %>% 
+  write_tsv('/workdir/backup/smallmouth/gtseq_production_2/sample_table.tsv',col_names = F)
+
+# key has 1)locus 2)F_primer without adapters 3)R_primer without adapters
+filter(ordered_amplicons, num %nin% primers_excluded$LocusID) %>% 
+  mutate(F_short = str_replace(`F`, 'CTACACGTTCAGAGTTCTACAGTCCGACGATC', ''),
+         R_short = str_replace(R, 'GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCT','')) %>% 
+  dplyr::select(microhap_name, F_short, R_short) %>% 
+  write_tsv('/workdir/backup/smallmouth/gtseq_production_2/key.tsv', col_names=F)
+
+# desired maf is 1/(2*nInd)
+tt<-read_tsv('/workdir/backup/smallmouth/gtseq_production_2/sample_table.tsv')
+1/(2*nrow(tt))
+
+# Make a reference genome that contains just the haplotypes between the primers
+fasta_between_primers<-read_tsv('/workdir/backup/smallmouth/gtseq_production_2/key.tsv', col_names = c('microhap_name','F_pri','R_pri')) %>% 
+  left_join(dplyr::select(ordered_amplicons, microhap_name, seq=microhap_sequence), by = 'microhap_name') %>% 
+  mutate(R_pri = as.character(Biostrings::reverseComplement(Biostrings::DNAStringSet(R_pri)))) %>% 
+  rowwise() %>% mutate(seq = str_replace(seq, as.character(F_pri), '--'),
+                       seq = str_replace(seq, as.character(R_pri), '--')) %>% ungroup() %>% 
+  separate(seq, into = c('before','between_primers','after'), sep = '--') %>% 
+  mutate(microhap_name = str_replace(microhap_name, '\\.',''))
+  
+seqinr::write.fasta(names = as.list(fasta_between_primers$microhap_name), sequences = as.list(fasta_between_primers$between_primers), file.out = '/workdir/smallmouth/gtseq/results/reference_between_primers.fasta')
+```
+
+Do the bash work
+```{bash}
+cd /workdir/backup/smallmouth/gtseq_production_2
+mkdir amp_py_output
+# git clone https://bitbucket.org/cornell_bioinformatics/amplicon.git
+
+# Amplicon.py first pass - call haplotypes
+# git clone https://bitbucket.org/cornell_bioinformatics/amplicon.git
+export PATH=/programs/cutadapt-4.1/bin:/programs/muscle:/programs/bbmap-39.01:$PATH
+export PYTHONPATH=/programs/cutadapt-4.1/lib/python3.9/site-packages:/programs/cutadapt-4.1/lib64/python3.9/site-packages
+nohup amplicon/amplicon.py -s sample_table.tsv -k key.tsv -o amp_py_output -a 0.0002747253 -c 2 -l 50 -r 5 -j 40 &
+
+# run through each of the haplotypes and filter for those that match reference (70% similar within 25bp of start and end of each haplotype)
+cd amp_py_output
+amplicon_filter.py -i HaplotypeAllele.fasta  -f 2 -r /workdir/smallmouth/gtseq/results/reference_between_primers.fasta
+
+# Use these filtered haplotypes to filter the individual calls (sets genotypes as NA?)
+cd ..
+amplicon/amplicon.py  -s sample_table.tsv -k key.tsv -o amp_py_output -a 0.0002747253 -c 2 -l 50 -r 5 -j 40 -i 1 -g amp_py_output/amplicon.kept.fasta -o amp_py_output
+```
+
+Sanity check - take a look at each of the contig alignments
+```{r}
+commonAlleles<-Biostrings::readDNAStringSet('/workdir/backup/smallmouth/gtseq_production_2/amp_py_output/amplicon.kept.fasta')
+DECIPHER::BrowseSeqs(commonAlleles, htmlFile = '/workdir/smallmouth/gtseq/results/contig_alignments_all.html', openURL = F) # take a look at the sequences
+```
+
+exclude contaminated inds and paralogs, and export genotype matrix
+```{r}
+ar_thresh <- 0.2
+read_depth_thresh <- 15
+paralog_thresh <- 0.15
+sum_contam_loci_thresh <- 5
+
+tbs_out<-tibble()
+
+for(i in list.files(path='/workdir/backup/smallmouth/gtseq_production_2/amp_py_output/tagBySampleDir/', pattern='tbs', full.names = T)){
+  try(
+    tbs_out<-read_tsv(i, col_names = c('ind','contig','seq','reads')) %>% 
+    group_by(contig) %>% mutate(max_read=max(reads)) %>% ungroup() %>% 
+    mutate(AR = reads/max_read) %>% 
+    dplyr::select(-seq) %>% 
+    bind_rows(tbs_out)
+  )
+}
+
+write_csv(tbs_out, '/workdir/smallmouth/gtseq/results/reads_per_allele_ind_contamination.csv')
+
+tbs_out<-read_csv('/workdir/smallmouth/gtseq/results/reads_per_allele_ind_contamination.csv') %>% 
+  separate(ind, into = c('ind', 'xx'), sep = '__') %>% 
+  filter(reads>read_depth_thresh, AR > ar_thresh) %>% 
+  group_by(ind, contig) %>% tally() %>% ungroup() %>% 
+  mutate(contam_paralog=if_else(n<3, 0, 1))
+
+ggplot(tbs_out, aes(ind, contig, fill = as.character(contam_paralog))) + geom_tile() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ggsave('/workdir/smallmouth/gtseq/results/3_or_more_haps_per_locus_indiv.png', height = 15, width = 15)
+
+# determine threshold by plotting hist
+group_by(tbs_out, contig) %>% summarise(perc_paralog = mean(contam_paralog)) %>% ggplot(aes(perc_paralog)) + geom_histogram()
+
+# Here, make a list of the loci that exceed out threshold
+  paralogs<-group_by(tbs_out, contig) %>% summarise(perc_paralog = mean(contam_paralog)) %>% filter(perc_paralog > paralog_thresh)
+  
+  write_csv(paralogs, '/workdir/smallmouth/gtseq/results/paralogs.csv')
+  
+# Next, remove tnose loci, and exclude individuals which show contamination
+  contam_all<-filter(tbs_out, contig %nin% paralogs$contig) %>% 
+  group_by(ind) %>% summarise(sum_contam_loci = sum(contam_paralog))
+  
+  ggplot(contam_all, aes(sum_contam_loci)) + geom_histogram()
+  
+    filter(contam_all, sum_contam_loci > sum_contam_loci_thresh) %>% 
+    write_csv('/workdir/smallmouth/gtseq/results/contam_ind.csv')
+  
+# Import genotypes and set any genotypes with read depth < 20 to NA
+genos<-read_tsv('/workdir/backup/smallmouth/gtseq_production_2/amp_py_output/hap_genotype') %>% 
+  dplyr::select(-Haplotypes) %>% 
+  pivot_longer(-Locus, names_to = 'ind', values_to = 'genotype_read_depth') %>% 
+  separate(ind, into = c('ind','xx'), sep = '__') %>% 
+  separate(genotype_read_depth, into = c('genotype','read_depth'), sep = ':') %>% 
+  separate(read_depth, into = c('read_depth_1','read_depth_2'), sep = ',') %>% 
+  mutate(read_depth_1 = as.integer(read_depth_1),
+         read_depth_2 = as.integer(read_depth_2),
+         read_depth=if_else(is.na(read_depth_2), read_depth_1, (read_depth_1+read_depth_2))) %>% 
+  filter(Locus %nin% read_csv('/workdir/smallmouth/gtseq/results/paralogs.csv')$contig,
+         ind %nin% read_csv('/workdir/smallmouth/gtseq/results/contam_ind.csv')$ind) %>% 
+  separate(genotype, into = c('haplotype.1', 'haplotype.2'), remove = F) %>%  
+  rowwise() %>% mutate(genoty = paste0(sort(c(haplotype.1,haplotype.2)), collapse = '/')) %>% ungroup() %>%  # This makes sure that the genotypes are ordered properly
+  dplyr::select(locus=Locus, GENID_duplicate = ind, genoty, haplotype.1, haplotype.2, read_depth)
+
+# write out so I can assess read depth later
+write_csv(genos, '/workdir/backup/smallmouth/gtseq_production_2/amp_py_output/hap_genotype_read_depth.csv')
+```
+
+### prep files for microhaplot, and call SNPs while I'm at it
+
+prep the demultiplexing file and reverse complement it
+```{r}
+run<-'gtseq_production_1'
+
+   demult<-read_tsv('/workdir/smallmouth/gtseq/GTscore-materials/brc_demultiplex_gtseq_production_1.txt') %>%
+       mutate(`Sample ID` = paste0(run, '__', `Sample ID`)) # This is to separate samples on different lanes
+
+     
+  demult<-read_tsv('/workdir/backup/smallmouth/gtseq_production_2/demultiplex/brc_demultiplex_gtseq_production_2.txt', col_names=c('Sample ID', 'I7_barcode', 'I5_barcode')) %>% 
+    mutate(`Sample ID` = paste0(run, '__', `Sample ID`)) # This is to separate samples on different lanes
+  
+  revComp<-Biostrings::reverseComplement(Biostrings::DNAStringSet(demult$I5_barcode))
+  bind_cols(demult, tibble(I5_barcode_rev=as.character(revComp))) %>% 
+  dplyr::select(`Sample ID`, I7_barcode, I5_barcode = I5_barcode_rev) %>% 
+    write_tsv(paste0('/workdir/smallmouth/gtseq/GTscore-materials/brc_demultiplex_',run,'_revComp.txt'))
+```
+
+flash the combined R1 and R2 files, index amplicon reference genome, then demultiplex/map/convert to bam/sort/index before making vcf file and filtering the VCF a bit
+```{bash}
+# set run name and download data
+run=gtseq_production_2
+cd /workdir/backup/smallmouth/$run
+bash download.sh
+
+# combine R1's and R2's
+nohup zcat *R2.fastq* > combined_R2.fastq &
+nohup zcat *R1.fastq* > combined_R1.fastq &
+
+# flash the R1's and R2's. 5 vs 10 lower end doesn't make a difference, and 200 vs 150 max overlap
+export PATH=/workdir/smallmouth/software/FLASH2:$PATH
+flash2 combined_R1.fastq combined_R2.fastq -m 10 -M 200 -o clipped_flashed
+mkdir demultiplex
+mv flashed.extendedFrags.fastq demultiplex/
+
+# rm or gzip to save space
+rm combined_R2.fastq
+rm combined_R1.fastq 
+rm flashed.*
+
+# demultiplex - need to add BRC demultiplexing txt file with header "Sample ID I7_barcode  I5_barcode". 
+cd demultiplex
+nohup perl /workdir/smallmouth/gtseq/GTscore/DemultiplexGTseq.pl -b /workdir/smallmouth/gtseq/GTscore-materials/brc_demultiplex_${run}_revComp.txt -s flashed.extendedFrags.fastq &
+
+# rm !(*extended*) # if this messes up and I need to remove everything except for the original file, run this
+rm flash*
+
+# here i move everything into one file
+cd /workdir/backup/smallmouth/gtseq_production_1/demultiplex/
+mv * /workdir/backup/smallmouth/gtseq_production_2/demultiplex/
+
+# run script that maps, converts sam to bam, and sorts bam file, then cleans up and makes a bamlist and idxstats
+nohup bash /workdir/smallmouth/gtseq/genotyping/map_bam_index.sh &
+
+# call variants with freebayes -k (no pop priors), -w (hwe priors off), -V (binomial-obs-priors-off), -a (allele-balance-priors-off) - microhaplot did --haplotype-length 0 but since I want indels I'm keeping this (for now). If the indels end up not working, can do --haplotype-length 0 --no-mnps --no-complex
+export PATH=/programs/freebayes-1.3.5/bin:$PATH
+export PATH=/programs/freebayes-1.3.5/scripts:$PATH
+export PATH=/programs/vcflib-1.0.1/bin:$PATH
+export PATH=/programs/vcflib-1.0.1/scripts:$PATH
+      
+# only needed for many samples (takes 30 minutes with NextSeq run), over 300bp chunks of the reference
+nohup freebayes-parallel <(fasta_generate_regions.py /workdir/smallmouth/gtseq/amplicon_ref_genome/amplicon_reference.fasta.fai 300) 30 -f /workdir/smallmouth/gtseq/amplicon_ref_genome/amplicon_reference.fasta -L bamlist.txt -kwVa > smb_${run}_ampliconRef_300.vcf &
+
+# first have to remove weird header (may have to do +5)
+tail -n +3 smb_${run}_ampliconRef_300.vcf > smb_${run}_ampliconRef_300.vcf.remHeader 
+
+# depth and quality filter
+/programs/bcftools-1.15.1-r/bin/bcftools filter -e 'QUAL<20 | INFO/DP<400'  smb_${run}_ampliconRef_300.vcf.remHeader -o smb_${run}_ampliconRef_300.vcf.remHeader.qual
+
+# just SNPs for microhaplot
+/programs/bcftools-1.15.1-r/bin/bcftools filter -e 'TYPE!="snp"' smb_${run}_ampliconRef_300.vcf.remHeader.qual -o smb_${run}_ampliconRef_300.vcf.remHeader.qual.justSnp
+
+# clean up
+rm *fastq
+```
+
+### run microhaplot
+
+Read in the generated tsv file (human-readable vcf) and launch microhaplot
+```{r}
+run<-'gtseq_production_2'
+
+# Make the label file
+
+    read_tsv(paste0('/workdir/backup/smallmouth/',run,'/demultiplex/bamlist.txt'), col_names = 'sam') %>% 
+      filter(!str_detect(sam, 'flashed')) %>% 
+      mutate(ind = str_replace(sam, '.fastq_sam.bam.sorted', ''),
+             sam = str_replace(sam, '.fastq_sam.bam.sorted', '.fastq.sam'),
+             group = 1) %>% 
+        write_tsv(paste0('/workdir/smallmouth/gtseq/microhaplot/microhaplot_label_',run,'.txt'), col_names = F)
+    
+    library(microhaplot)
+    library(tidyverse)
+
+# Set things up and run the shiny app
+
+    shiny_dir<- '/workdir/smallmouth/gtseq/microhaplot/'
+    microhaplot::mvShinyHaplot(shiny_dir)
+    app.path <- file.path(shiny_dir, "microhaplot")
+    
+    haplo<-prepHaplotFiles(run.label = run, 
+                           sam.path = paste0('/workdir/backup/smallmouth/',run,'/demultiplex'), 
+                           label.path = paste0('/workdir/smallmouth/gtseq/microhaplot/microhaplot_label_',run,'.txt'),
+                           vcf.path = paste0('/workdir/backup/smallmouth/',run,'/demultiplex/smb_',run,'_ampliconRef_300.vcf.remHeader.qual.justSnp'),
+                           app.path = app.path,
+                           out.path = paste0('/workdir/backup/smallmouth/',run),
+                           n.jobs = 15)
+    
+    # Diana uses allelic ratio of 0.2 and haplotype read depth of 20 (but can go as low as 10)
+    # I want to download the observed_unfiltered_haplotype (for paralog check), reported_diploid_haplotype (for microhaps), and snp_report (for single SNPs)
+
+    runShinyHaplot("/workdir/smallmouth/gtseq/microhaplot//microhaplot")
+    
+```
+
+# raw genotype QC - contamination, paralogous loci
+
+Filter out the individuals that are contaminated. Check loci for paralogous regions (amplifying more than 2 region of the genome)
+```{r}
+run<-'gtseq_production_2'
+
+haps_in<-read_csv(paste0('/workdir/smallmouth/gtseq/microhaplot/observed_unfiltered_haplotype_',run,'.csv'))
+
+read_depth_thresh<-15
+allelic_ratio<-0.2
+paralog_thresh<-0.2 # percent of individuals having more than 2 haps in a locus needed to call it a paralog
+contam_thresh<-0.05 # number of loci needed to call an individual contaminated 
+
+bad_loci_inds<-haps_in %>% 
+  filter(depth>read_depth_thresh & allele.balance > allelic_ratio) %>% 
+  group_by(indiv.ID, locus) %>% summarise(n_haps=n()) %>% ungroup() %>% mutate(contam_par = if_else(n_haps>2, 1, 0))
+
+# first, ID the paralogs and make a list
+paralogs<-group_by(bad_loci_inds, locus) %>% summarise(perc_paralog = mean(contam_par)) %>% filter(perc_paralog > paralog_thresh)
+write_csv(paralogs, '/workdir/smallmouth/gtseq/results/paralogs.csv')
+
+# Next, remove those loci, and exclude individuals which show contamination
+  filter(bad_loci_inds, locus %nin% paralogs$locus) %>% 
+  group_by(indiv.ID) %>% summarise(mean_contam_loci = mean(contam_par)) %>% 
+    filter(mean_contam_loci >= contam_thresh) %>% 
+    write_csv('/workdir/smallmouth/gtseq/results/contam_ind.csv')
+```
+
+Can I get more individuals in 1970 with a lower read depth ratio?
+```{r}
+run<-'gtseq_production_2'
+read_csv(paste0('/workdir/smallmouth/gtseq/microhaplot/observed_unfiltered_haplotype_',run,'.csv')) %>% 
+  filter((str_detect(indiv.ID, '1962') | str_detect(indiv.ID, '1971')) & str_detect(locus, 'adaptive') & allele.balance > 0.2)
+
+```

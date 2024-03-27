@@ -1,0 +1,519 @@
+---
+title: "Data processing"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Before getting going
+
+Make the barcode list with [i7]+[i5] sample_lists/barcode_list_lane_xxx.txt
+  To reverse complement, http://www.reverse-complement.com/, and make sure to reverse order afterwards
+  DON'T FORGET THE REFERENCE INDIVIDUAL, LIKELY ON TRUSEQ RATHER THAN NEXTERA BARCODES
+Make the sample list
+
+## Demultiplexing
+
+**Run this under a directory named demultiplexed because output is placed in working directory.
+To do in the future: loop this
+
+New barcode sample list is necessary for new lanes
+
+```{bash eval=FALSE, include=TRUE}
+## Lane 4 (using same barcode list as lane 2/3) 54540
+nohup bash /programs/bbmap-38.45/demuxbyname.sh \
+in=/workdir/backup/smallmouth/lane4/usftp21.novogene.com/raw_data/LZ3/LZ3_CKDL210005993-1a_HFVKFCCX2_L4_2.fq.gz \
+in2=/workdir/backup/smallmouth/lane4/usftp21.novogene.com/raw_data/LZ3/LZ3_CKDL210005993-1a_HFVKFCCX2_L4_1.fq.gz \
+out=%_lane_4_R1.fastq.gz \
+out2=%_lane_4_R2.fastq.gz \
+outu=unknown_barcode_1_lane_4.fastq.gz \
+outu2=unknown_barcode_2_lane_4.fastq.gz \
+prefixmode=f \
+names=/workdir/smallmouth/sample_lists/barcode_list_lane_23.txt \
+> /workdir/smallmouth/nohups/demultiplex_low_coverage_lane_4.nohup &
+
+## Lane 2
+nohup bash /programs/bbmap-38.45/demuxbyname.sh \
+in=/workdir/backup/smallmouth/Lane2/raw_data/LZ2/LZ2_CKDL200169245-1a_HFJFGCCX2_L5_1.fq.gz \
+in2=/workdir/backup/smallmouth/Lane2cd /raw_data/LZ2/LZ2_CKDL200169245-1a_HFJFGCCX2_L5_2.fq.gz \
+out=%_lane_2_R1.fastq.gz \
+out2=%_lane_2_R2.fastq.gz \
+outu=unknown_barcode_1_lane_2.fastq.gz \
+outu2=unknown_barcode_2_lane_2.fastq.gz \
+prefixmode=f \
+names=/workdir/smallmouth/sample_lists/barcode_list_lane_23.txt \
+> /workdir/smallmouth/nohups/demultiplex_low_coverage_lane_2.nohup &
+
+## Lane 1
+nohup bash /programs/bbmap-38.45/demuxbyname.sh \
+in=/workdir/backup/smallmouth/Lane3/LZ1_CKDL190144419-1a_H75VVCCX2_L4_1.fq.gz \
+in2=/workdir/backup/smallmouth/Lane3/LZ1_CKDL190144419-1a_H75VVCCX2_L4_2.fq.gz \
+out=%_lane_1_R1.fastq.gz \
+out2=%_lane_1_R2.fastq.gz \
+outu=unknown_barcode_1.fastq.gz \
+outu2=unknown_barcode_2.fastq.gz \
+prefixmode=f \
+names=/workdir/smallmouth/sample_lists/barcode_list_lane_1.txt \
+> /workdir/smallmouth/nohups/demultiplex_low_coverage.nohup &
+
+## Lane 1: I forgot to add reference individual , fixing that mistake here
+nohup bash /programs/bbmap-38.45/demuxbyname.sh \
+in=/workdir/smallmouth/demultiplexed/unknown_barcode_1.fastq.gz \
+in2=/workdir/smallmouth/demultiplexed/unknown_barcode_2.fastq.gz \
+out=%_lane_1_R1.fastq.gz \
+out2=%_lane_1_R2.fastq.gz \
+outu=unknown_barcode_1_actual.fastq.gz \
+outu2=unknown_barcode_2_actual.fastq.gz \
+prefixmode=f \
+names='TCCGCGAA+TCAGAGCC' \
+> /workdir/smallmouth/nohups/demultiplex_high_coverage.nohup &
+
+# After finishing, deleted old unknown_barcode_?.fastq.gz and changed name of unknown_barcode_?_actual.fastq.gz to get rid of the "actual"
+
+## Rename these demultiplexed files so that the names won't contain a plus sign (which will interfere with downstream stuff)
+find /workdir/smallmouth/demultiplexed/ -depth -name '*+*' -execdir bash -c 'mv -- "$1" "${1//+/_}"' bash {} \;
+```
+
+Note: If there are samples that were run as part of my lane, I can not include them in the demultiplexing by not adding their barcodes to the barcode file. They will be put in the "unknown barcodes" folder
+
+## Adapter clipping
+This gets rid of the adapters which bind the insert to i5 & i7 barcodes
+
+information for setting up table is in sucker/sample_lists/sample_table.tsv
+make a sample_table.tsv, and sample_list_lane_1.txt (which just has prefix, but delete header)
+In sample_table.tsv, got rid of CONTROL and individuals that I did not submit for sequencing
+Importnat! If made in excel, double-check that the file doesn't have CRLF line terminators
+in ~/sample_lists, [file * | grep CRLF] to check
+If they do, [dos2unix sample_list_lane_2.txt]
+
+If the insert size is too small or nonexistant, it will go into "unpaired". if it works (large insert size), goes into "paired"
+
+If forgot stuff and need to add it, just make a new sample_list with just those individuals and run that instead of the sample_list line
+
+```{bash eval=FALSE, include=TRUE}
+## Lane 4 nextera  629
+
+nohup bash /workdir/data-processing/scripts/adapter_clipping.sh \
+/workdir/smallmouth/sample_lists/sample_list_lane_4_nextera.txt \
+/workdir/smallmouth/sample_lists/sample_table_lane_4.tsv \
+/workdir/smallmouth/demultiplexed/ \
+/workdir/smallmouth/ \
+_R1.fastq.gz \
+_R2.fastq.gz \
+/workdir/cod/reference_seqs/NexteraPE_NT.fa >& \
+/workdir/smallmouth/nohups/adapter_clipping_lane_4_nextera.nohup &
+  
+# If its only one lane, do the above code. if its multiple, can do the below
+
+[1] 46562
+[2] 46563
+  
+for k in {3..4}; do
+nohup bash /workdir/data-processing/scripts/adapter_clipping.sh \
+'/workdir/smallmouth/sample_lists/sample_list_lane_'$k'_nextera.txt' \
+'/workdir/smallmouth/sample_lists/sample_table_lane_'$k'.tsv' \
+/workdir/smallmouth/demultiplexed/ \
+/workdir/smallmouth/ \
+_R1.fastq.gz \
+_R2.fastq.gz \
+/workdir/cod/reference_seqs/NexteraPE_NT.fa >& \
+'/workdir/smallmouth/nohups/adapter_clipping_lane_'$k'_nextera.nohup' &
+done
+
+## Lane 2-3 truseq
+
+for k in {2..3}; do
+nohup bash /workdir/data-processing/scripts/adapter_clipping.sh \
+'/workdir/smallmouth/sample_lists/sample_list_lane_'$k'_truseq.txt' \
+'/workdir/smallmouth/sample_lists/sample_table_lane_'$k'.tsv' \
+/workdir/smallmouth/demultiplexed/ \
+/workdir/smallmouth/ \
+_R1.fastq.gz \
+_R2.fastq.gz \
+/workdir/cod/reference_seqs/NexteraPE_NT.fa >& \
+'/workdir/smallmouth/nohups/adapter_clipping_lane_'$k'_truseq.nohup' &
+done
+```
+
+## FASTQC
+
+```{bash eval=FALSE, include=TRUE}
+# Run fastqc for a single sample
+cd /workdir/smallmouth/adapter_clipped
+fastqc E16_TGCAGCTA_TCGCATAA_4_adapter_clipped_r_paired.fastq.gz
+mv *fastqc* /workdir/smallmouth/fastqc/
+
+# Run fastqc for all (lane 4) files 48984
+nohup fastqc /workdir/smallmouth/adapter_clipped/*4_adapter_clipped_f_paired.fastq.gz &
+mv *fastqc* /workdir/smallmouth/fastqc/
+ 
+# Run multiQC on the fastqc folder 3003
+nohup bash /workdir/smallmouth/scripts/run_multiqc.sh &
+```
+
+## Count reads
+This section counts how many reads and adapter_clipped_bases there are for each individual
+
+```{bash eval=FALSE, include=TRUE}
+
+## Lane 2-3 
+# The "false" is whether they have gone through quality filtering. Not yet! If I had done polyg filtering then yes
+
+# truseq 10816 10817
+
+for k in {3..4}; do
+  nohup bash /workdir/data-processing/scripts/count_fastq.sh \
+  '/workdir/smallmouth/sample_lists/sample_list_lane_'$k'_truseq.txt' \
+  '/workdir/smallmouth/sample_lists/sample_table_lane_'$k'.tsv' \
+  /workdir/smallmouth/demultiplexed/ \
+  /workdir/smallmouth/ \
+  @N \
+  false \
+  >& '/workdir/smallmouth/sample_lists/fastq_count_lane_'$k'_truseq.tsv' 2> \
+  nohup.err < /dev/null &
+done
+
+# nextera [2] 49558, [3] 49559
+
+for k in {3..4}; do
+  nohup bash /workdir/data-processing/scripts/count_fastq.sh \
+  '/workdir/smallmouth/sample_lists/sample_list_lane_'$k'_nextera.txt' \
+  '/workdir/smallmouth/sample_lists/sample_table_lane_'$k'.tsv' \
+  /workdir/smallmouth/demultiplexed/ \
+  /workdir/smallmouth/ \
+  @N \
+  false \
+  >& '/workdir/smallmouth/sample_lists/fastq_count_lane_'$k'_nextera.tsv' 2> \
+  nohup.err < /dev/null &
+done
+
+```
+
+## Build bowtie reference index 40331
+This is an indexer to run before mapping to genome
+Makes dict & bt2 files in ~/genome/
+
+```{bash eval=FALSE, include=TRUE}
+nohup bash /workdir/data-processing/scripts/build_bowtie_ref_index.sh \
+/workdir/smallmouth/genome/ragtag_output/ragtag.scaffold.fasta \
+smb_anchored \
+> /workdir/smallmouth/nohups/build_bowtie_ref_index.nohup &
+```
+
+## Map to reference genome 
+This section associates fragments to different regions of the genome
+16 is cores (selected default), so that I can to the 11th argument, mapping quality, to set it to 20
+
+MAKE SURE BOWTIE IS DONE BEFORE STARTING: ls -lth in genome folder to make sure the bt2 & dict files are done
+
+```{bash eval=FALSE, include=TRUE}
+nohup bash /workdir/data-processing/scripts/low_coverage_mapping.sh \
+/workdir/smallmouth/sample_lists/sample_list_genome_test.txt \
+/workdir/smallmouth/sample_lists/sample_table_lane_1.tsv \
+/workdir/smallmouth/adapter_clipped/ \
+/workdir/smallmouth/ \
+_adapter_clipped_f_paired.fastq.gz \
+_adapter_clipped_r_paired.fastq.gz \
+very-sensitive \
+/workdir/smallmouth/genome/ragtag_output/smb_anchored.fasta \
+smb_anchored \
+6 \
+20 \
+> /workdir/smallmouth/nohups/low_coverage_mapping_smb_anchored.nohup &
+```
+
+Iterate over all 4 lanes on new assembly 
+took about 48 hrs with 8 cores each, the whole server was going
+
+This is now set up for mtGenome - for whole genome, change args 8 & 9
+Change the lanes needed, arg 1,2, and nohup
+```{bash eval=FALSE, include=TRUE}
+nohup bash /workdir/data-processing/scripts/low_coverage_mapping.sh \
+  /workdir/smallmouth/sample_lists/sample_list_lane_4_nextera.txt \
+  /workdir/smallmouth/sample_lists/sample_table_lane_4.tsv \
+  /workdir/smallmouth/adapter_clipped/ \
+  /workdir/smallmouth/ \
+  _adapter_clipped_f_paired.fastq.gz \
+  _adapter_clipped_r_paired.fastq.gz \
+  very-sensitive \
+  /workdir/smallmouth/genome/mtgenome/smb_mitogenome_ncbi.fasta \
+  smb_mt \
+  6 \
+  20 \
+  >& /workdir/smallmouth/nohups/mapping_lane_4.nohup &
+
+```
+
+## Count unmerged bam files
+Not necessary to do for mitochondrial, no pre-mapping base count. However, I'm interested in coverage by lane
+the 20 below just counts the reads that are above mapping quality score of 20
+
+Testing new assembly
+[1] 31947
+[2] 31948
+[3] 31949
+[4] 31950
+```{bash eval=FALSE, include=TRUE}
+nohup bash /workdir/data-processing/scripts/count_bam_unmerged.sh \
+  /workdir/smallmouth/sample_lists/sample_list_genome_test.txt \
+  /workdir/smallmouth/sample_lists/sample_table_lane_1.tsv \
+  /workdir/smallmouth/ \
+  smb_anchored \
+  samtools \
+  20 \
+  >& /workdir/smallmouth/sample_lists/bam_count_unmerged_mapping.tsv 2> nohup.err < /dev/null &
+
+# Running bam counting on all lanes 
+
+for k in {1..4}; do
+  nohup bash /workdir/data-processing/scripts/count_bam_unmerged.sh \
+  '/workdir/smallmouth/sample_lists/sample_list_lane_'$k'_nextera.txt' \
+  '/workdir/smallmouth/sample_lists/sample_table_lane_'$k'.tsv' \
+  /workdir/smallmouth/ \
+  smb_anchored \
+  samtools \
+  20 \
+  >& /workdir/smallmouth/sample_lists/bam_count_unmerged_mapping_lane_'$k'.tsv 2> nohup.err < /dev/null &
+done
+```
+
+## Merge duplicated samples (single lane)
+This will make three txt files in sample_lists, which should guide the merging script
+Just run this one chunk, no need to drop it into bash (like a multiple lane merge)
+
+Things to change for new lanes:
+refname
+filter (choose if we want to filter out any individuals - since I was doing a genome test, I filtered for just the individuals I needed)
+write_tsv
+write_lines
+
+```{r eval=FALSE, include=TRUE}
+library(tidyverse)
+
+refname <- "smb_anchored"
+
+## Define base directory and reference name
+basedir <- "/workdir/smallmouth/" # basedir for server files
+
+## Read in unmerged sample tables
+sample_table_merged <- read_tsv("../sample_lists/sample_table_lane_1.tsv") %>%
+mutate(sample_seq_id=paste(sample_id,seq_id,lane_number, data_type, sep = "_")) %>%
+  select(sample_seq_id, lane_number, seq_id, sample_id, population, data_type)
+write_tsv(sample_table_merged, "../sample_lists/sample_table_merged_test_smb_anchored.tsv")
+bam_list_merged <- paste0(basedir, "bam/", sample_table_merged$sample_seq_id, "_bt2_", refname, "_minq20_sorted.bam")
+bam_list_dedup_overlapclipped <- transmute(sample_table_merged, suffix=ifelse(data_type=="se", paste0("_bt2_", refname, "_minq20_sorted_dedup.bam"), paste0("_bt2_", refname, "_minq20_sorted_dedup_overlapclipped.bam"))) %>%
+  .$suffix %>%
+  paste0(basedir, "bam/", sample_table_merged$sample_seq_id, .)
+bam_list_realigned <- transmute(sample_table_merged, suffix=ifelse(data_type=="se", paste0("_bt2_", refname, "_minq20_sorted_dedup_realigned.bam"), paste0("_bt2_", refname, "_minq20_sorted_dedup_overlapclipped_realigned.bam"))) %>%
+  .$suffix %>%
+  paste0(basedir, "bam/", sample_table_merged$sample_seq_id, .)
+write_lines(bam_list_merged, "../sample_lists/bam_list_merged_test_smb_anchored.txt")
+write_lines(bam_list_dedup_overlapclipped, "../sample_lists/bam_list_dedup_overlapclipped_test_smb_hybrid.txt")
+write_lines(bam_list_realigned, "../sample_lists/bam_list_realigned_test_smb_anchored.txt")
+```
+
+
+
+## Create merged sample tables (multiple lanes)
+This needs to be done for nuclear genome and mitochondrial genome, respectively
+
+Things to change for new lanes
+refname
+for (i in 1:3)
+write_tsv
+write_lines (three of these lines)
+
+```{r eval=FALSE, include=TRUE}
+library(tidyverse)
+
+## Testing different genomes
+
+## Define base directory and reference name
+basedir <- "/workdir/smallmouth/"
+refname <- "smb_anchored"
+
+## Read in unmerged sample tables
+for (i in 1:4){
+  sample_table <- read_tsv(paste0("../sample_lists/sample_table_lane_", i, ".tsv")) %>%
+    mutate(seq_id=as.character(seq_id), lane_number = as.character(lane_number), sample_seq_id=paste(sample_id,seq_id,lane_number, sep = "_"))
+  if (i == 1){
+    sample_table_final <- sample_table
+  } else {
+    sample_table_final <- bind_rows(sample_table_final, sample_table)
+  }
+}
+
+## Add a sample_id_corrected column, just in case that the same sample got assigned different IDs, or a few of the IDs are wrong
+# This is not the case for the GoSL cod project
+# When this happends, just edit "wrong_id" and "correct_id"
+sample_table_final <- mutate(sample_table_final, sample_id_corrected=ifelse(sample_id!="wrong_id", sample_id, "correct_id"))
+
+## Create a merged table by keeping only one row for each unique sample
+# seq_id, lane_number, and data_type are all replaced with "merged" for duplicated samples
+sample_table_merged <- filter(sample_table_final, sample_id!="F3") %>%
+    group_by(sample_id_corrected) %>%
+  summarise(population=unique(population), seq_id=ifelse(n()==1,seq_id, "merged"), lane_number=ifelse(length(unique(lane_number))==1,unique(lane_number), "merged"), data_type=paste0(unique(data_type), collapse = "")) %>%
+  mutate(sample_seq_id=paste(sample_id_corrected, seq_id, lane_number, data_type, sep = "_")) %>%
+  select(sample_seq_id, lane_number, seq_id, sample_id_corrected, population, data_type)
+
+## Write the merged table
+write_tsv(sample_table_merged, "../sample_lists/sample_table_merged_smb_anchored.tsv")
+
+## Create bam lists as inputs for future steps
+bam_list_merged <- paste0(basedir, "bam/", sample_table_merged$sample_seq_id, "_bt2_", refname, "_minq20_sorted.bam")
+bam_list_dedup_overlapclipped <- transmute(sample_table_merged, suffix=ifelse(data_type=="se", paste0("_bt2_", refname, "_minq20_sorted_dedup.bam"), paste0("_bt2_", refname, "_minq20_sorted_dedup_overlapclipped.bam"))) %>%
+  .$suffix %>%
+  paste0(basedir, "bam/", sample_table_merged$sample_seq_id, .)
+bam_list_realigned <- transmute(sample_table_merged, suffix=ifelse(data_type=="se", paste0("_bt2_", refname, "_minq20_sorted_dedup_realigned.bam"), paste0("_bt2_", refname, "_minq20_sorted_dedup_overlapclipped_realigned.bam"))) %>%
+  .$suffix %>%
+  paste0(basedir, "bam/", sample_table_merged$sample_seq_id, .)
+write_lines(bam_list_merged, "../sample_lists/bam_list_merged_smb_anchored.txt")
+write_lines(bam_list_dedup_overlapclipped, "../sample_lists/bam_list_dedup_overlapclipped_smb_anchored.txt")
+write_lines(bam_list_realigned, "../sample_lists/bam_list_realigned_smb_anchored.txt")
+```
+
+## write the merging script (multiple lanes)
+Things to change: nothing
+
+```{r eval=FALSE, include=TRUE}
+## Find all duplicated samples
+duplicated_samples <- (sample_table_final$sample_id_corrected)[duplicated(sample_table_final$sample_id_corrected)] %>% unique()
+duplicated_samples_seq_ids <- sample_table_merged[match(duplicated_samples,sample_table_merged$sample_id_corrected),] %>%
+  .$sample_seq_id
+merging_script<-NULL
+
+## Loop through all duplicated samples 
+for (i in 1:length(duplicated_samples)){
+  duplicated_sample <- duplicated_samples[i]
+  duplicated_samples_seq_id <- duplicated_samples_seq_ids[i]
+  ## Extract the bam file names from the unmerged sample table
+  input <- filter(sample_table_final, sample_id_corrected==duplicated_sample) %>%
+    mutate(unmerged_bam=paste(sample_id, seq_id, lane_number, data_type, "bt2", refname, "minq20_sorted.bam", sep = "_")) %>% 
+    # Note that sample_id is used in here instead of sample_id_corrected, since the unmerged bam file still uses sample_id as part of its name, not the corrected one.
+    .$unmerged_bam %>%
+    paste0(basedir, "bam/", .) %>%
+    paste(collapse = " ")
+  
+  ## Paste together the command line
+  merging_script[i] <- paste0("samtools merge ", basedir, "bam/", duplicated_samples_seq_id, "_bt2_", refname, "_minq20_sorted.bam ", input)
+}
+
+## Write the script
+write_lines(merging_script, "../scripts/merge_bam.sh")
+```
+
+## Run the merging script (multiple lanes) 
+took 7 hours for 4 lanes, will know it is done when the last merged bam file is created
+Things to change: nothing
+
+```{bash eval=FALSE, include=TRUE}
+nohup bash /workdir/smallmouth/scripts/merge_bam.sh > /workdir/smallmouth/nohups/merge_bam.nohup &
+```
+
+## Deduplicate and clip overlapping read pairs 28464
+to check output, [ls -lth] in ../bam at _dupstat, _dedup, and _overlapclipped files
+I was getting a permission denied error on the bam_list_....txt, just restarted cmd and it worked
+~6 minutes per sample, about 24 hours for all lanes
+
+Things to change: line 2-4
+40751
+
+```{bash eval=FALSE, include=TRUE}
+nohup bash /workdir/data-processing/scripts/deduplicate_clipoverlap.sh \
+/workdir/smallmouth/sample_lists/bam_list_merged_smb_anchored.txt \
+/workdir/smallmouth/sample_lists/sample_table_merged_smb_anchored.tsv \
+> /workdir/smallmouth/nohups/deduplicate_clipoverlap_smb_anchored.nohup &
+```
+
+## Count merged bam files 6011
+Should go pretty quick, ~1 min per sample
+
+```{bash eval=FALSE, include=TRUE}
+nohup bash /workdir/data-processing/scripts/count_bam_merged.sh \
+/workdir/smallmouth/sample_lists/bam_list_merged_smb_anchored.txt \
+/workdir/smallmouth/sample_lists/sample_table_merged_smb_anchored.tsv \
+samtools \
+20 \
+>& /workdir/smallmouth/sample_lists/bam_count_merged_anchored.tsv 2> nohup.err < /dev/null &
+
+```
+
+## Realign around indels
+
+This may already be fixed, check source code: If get error that .bai file is older than .bam file, remove all bai files. These are generated in the realign around indels step
+
+If some individuals are not allowing the script to run (they have no fragments mapped), nano into bam_list_dedup_overlapclipped.list and delete the offending individuals
+
+Don't need to run for mtDNA
+Took 26 hours for 4 lanes
+
+```{bash eval=FALSE, include=TRUE}
+# change name
+  cp /workdir/smallmouth/sample_lists/bam_list_dedup_overlapclipped_smb_anchored.txt \
+  /workdir/smallmouth/sample_lists/bam_list_dedup_overlapclipped_smb_anchored.list
+  
+# run scipt (got to do it in ../bam) 46397
+  cd /workdir/smallmouth/bam/
+
+  nohup bash /workdir/data-processing/scripts/realign_indels.sh \
+  /workdir/smallmouth/sample_lists/bam_list_dedup_overlapclipped_smb_anchored.list \
+  /workdir/smallmouth/ \
+  /workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta \
+  > /workdir/smallmouth/nohups/realign_indels.nohup &
+```
+### If realign isn't working, make sure to index bam files! 38204 ----
+
+```{bash eval=FALSE, include=TRUE}
+  nohup bash /workdir/smallmouth/scripts/index_bam.sh \
+  /workdir/smallmouth/sample_lists/bam_list_dedup_overlapclipped_smb_anchored.list \
+  /workdir/smallmouth/ \
+  /workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta \
+  > /workdir/smallmouth/nohups/index_bam.nohup &
+```
+## Count read depth per position 
+  Generates depth.gz for each file in ../bam
+  (12 hours 4 lanes 10 cores) 12388
+  first number is # cores, then the following two #'s are minbasequality & minmapquality
+
+```{bash eval=FALSE, include=TRUE}
+nohup bash /workdir/data-processing/scripts/count_depth_per_position_per_sample.sh \
+/workdir/smallmouth/sample_lists/bam_list_realigned_smb_anchored_mincov_filtered.txt \
+10 \
+20 \
+20 \
+samtools \
+> /workdir/smallmouth/nohups/count_depth_per_position_per_sample_mincov.nohup &
+```
+
+Now summarise these data. Write's 2 tsv: "depth_per_position_all_samples_histograph.tsv" and "presence...tsv" 56076
+```{bash eval=FALSE, include=TRUE}
+#Need to install the latest version of a package to prevent error
+Rscript /workdir/smallmouth/scripts/install_readCount_package.R
+
+nohup Rscript \
+/workdir/data-processing/scripts/summarize_depth_per_position.R \
+"/workdir/smallmouth/sample_lists/bam_list_realigned_smb_anchored_mincov_filtered.txt" \
+"/workdir/smallmouth/sample_lists/sample_table_merged_smb_anchored_mincov_filtered.tsv" \
+"/workdir/smallmouth/" \
+> /workdir/smallmouth/nohups/summarize_depth_per_position.out 2>&1 &
+
+# Now move onto read_count.Rmd to filter out low-coverage samples. Re-run just this R script summarize_depth_per_position.R with mincov_filtered out
+```
+
+## Now, move on to read_count.Rmd to filter out low-coverage samples and paramaterize minDepth, maxDepth, and minInd for SNP calling!
+
+## Cleaning up old files to save space on the server
+
+Get rid of everything except the realigned
+```{bash}
+cd /workdir/smallmouth/bam
+rm *smb_anchored.bam
+rm *sorted.bam
+rm *overlapclipped.bam
+rm *overlapclipped.bam.bai
+rm *dedup.bam
+rm *dupstat.txt
+
+```

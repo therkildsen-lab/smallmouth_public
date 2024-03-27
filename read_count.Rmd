@@ -1,0 +1,224 @@
+---
+title: "Final read count"
+output: 
+  github_document:
+    toc: true
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r warning=F, message=F}
+library(tidyverse)
+library(cowplot)
+library(knitr)
+
+basedir <- '/workdir/smallmouth'
+
+full_count <- read.csv(paste0(basedir, "/sample_lists/full_read_count.csv"))
+```
+
+## Per individual count
+
+#### Define some useful functions
+
+```{r message=F, warning=F}
+select_relevant_rows <- function(x){
+  dplyr::select(x, sample_id, population, raw_bases, adapter_clipped_bases, qual_filtered_bases, mapped_bases, dedup_mapped_bases, overlap_clipped_bases, minmapq20_bases)
+}
+sum_count <- function(x, unmerged_only){
+  if (unmerged_only==F){
+    summarize(x, raw_bases=sum(as.numeric(raw_bases)), 
+              adapter_clipped_bases=sum(as.numeric(adapter_clipped_bases)), 
+              qual_filtered_bases=sum(as.numeric(qual_filtered_bases)),
+              mapped_bases=sum(as.numeric(mapped_bases)), 
+              dedup_mapped_bases=sum(as.numeric(dedup_mapped_bases)),
+              overlap_clipped_bases=sum(as.numeric(overlap_clipped_bases)),
+              minmapq20_bases=sum(as.numeric(minmapq20_bases))) %>%
+      ungroup()
+  } else {
+        summarize(x, raw_bases=sum(as.numeric(raw_bases)), 
+              adapter_clipped_bases=sum(as.numeric(adapter_clipped_bases)), 
+              qual_filtered_bases=sum(as.numeric(qual_filtered_bases)),
+              mapped_bases=sum(as.numeric(mapped_bases))) %>%
+      ungroup()
+  }
+}
+```
+
+
+#### Data wrangling
+
+Make the full_count file (not needed if imported above), with low-coverage (0.1x) individuals excluded
+```{r message=F, warning=F, fig.height=9, fig.width=12}
+# sample_table_1<-read_tsv("../sample_lists/sample_table_lane_1.tsv")
+# sample_table_2<-read_tsv("../sample_lists/sample_table_lane_2.tsv")
+# sample_table_3<-read_tsv("../sample_lists/sample_table_lane_3.tsv")
+# sample_table_4<-read_tsv("../sample_lists/sample_table_lane_4.tsv")
+# sample_table <- bind_rows(sample_table_1, sample_table_2, sample_table_3, sample_table_4) %>%
+#   mutate(sample_lane = paste0(sample_id,"_",lane_number)) %>%
+#   dplyr::select(c(sample_lane, population))
+# 
+# fastq_count_1<-read_tsv("../sample_lists/fastq_count_lane_1_nextera.tsv")
+# fastq_count_2<-read_tsv("../sample_lists/fastq_count_lane_2_nextera.tsv")
+# fastq_count_3<-read_tsv("../sample_lists/fastq_count_lane_3_nextera.tsv")
+# fastq_count_4<-read_tsv("../sample_lists/fastq_count_lane_4_nextera.tsv")
+# fastq_count <- bind_rows(fastq_count_1, fastq_count_2, fastq_count_3, fastq_count_4) %>%
+#   separate(col = sample_seq_id, into = c('sample_id', NA, NA, 'lane_number'),  sep = "_") %>%
+#   mutate(sample_lane = paste0(sample_id,"_",lane_number)) %>%
+#   dplyr::select(!lane_number) %>%
+#   full_join(sample_table, by = 'sample_lane') %>%
+#   group_by(sample_id) %>%
+#   summarise(raw_bases = sum(raw_bases),
+#             adapter_clipped_bases = sum(adapter_clipped_bases),
+#             population = unique(population)) %>%
+#   filter(!is.na(population)) %>% # get rid of the old contaminated B samples
+#   filter(!is.na(raw_bases)) # get rid of the reference individual
+# 
+# full_count <- read_tsv("../sample_lists/bam_count_merged_anchored.tsv") %>%
+#   separate(col = sample_id, into = c('sample_id', NA, NA, NA)) %>%
+#   full_join(fastq_count, by = 'sample_id') %>%
+#   mutate(population = if_else(population == 'A', 'Little Moose 2000', 
+#                         if_else(population == 'B', 'First Bisby 2003',
+#                         if_else(population == 'C', 'First Bisby 2019', 
+#                         if_else(population == 'D', 'Little Moose 2019',
+#                         if_else(population == 'E', 'Third Bisby 2019',
+#                         if_else(population == 'F', 'Woodhull 2019', '0'))))))) %>% 
+#   filter(minmapq20_bases > 0.1*826000000) 
+# 
+# write_csv(full_count, "..//sample_lists//full_read_count.csv")
+
+```
+
+Coverage by pop and total
+```{r eval=FALSE}
+# Average coverage by population
+full_count %>%
+  group_by(population) %>%
+  summarise(sample_size=n(), 
+            total_coverage=sum(minmapq20_bases)/829000000,
+            average_coverage=total_coverage/sample_size,
+            fragment_size = mean(avg_fragment_size))
+
+# Plot coverage per pop
+full_count %>% 
+  group_by(population) %>%
+  summarise(raw_bases = mean(raw_bases),
+            adapter_clipped = mean(adapter_clipped_bases),
+            minmapq20_filtered = mean(minmapq20_bases),
+            overlap_clipped = mean(overlap_clipped_bases),
+            dedup_bases = mean(dedup_mapped_bases)) %>% 
+  pivot_longer(!population, names_to = 'step', values_to = 'meanBp') %>% 
+  mutate(step = factor(step, levels = c('raw_bases', 'adapter_clipped', 'minmapq20_filtered', 'dedup_bases', 'overlap_clipped'))) %>% 
+  ggplot() +
+    geom_bar(aes(population, meanBp/829000000, fill = step), stat = 'identity') +
+    #geom_label() +
+    ylab('Mean coverage per individual') +
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 12)) +
+    xlab('') +
+    coord_flip()
+
+```
+
+
+## Write a bam list and a sample table with invididuals with <0.1x coverage filtered out
+Not needed if done alread
+```{r eval=F}
+# ## bam list
+# read_tsv(paste0(basedir, "/sample_lists/bam_list_realigned_smb_anchored.txt"), col_names = FALSE) %>% 
+#   mutate(sample_id=str_sub(X1, 25, 27)) %>%  # This subsets just the sample_id
+#   mutate_at("sample_id", str_replace, "_", "") %>% 
+#   semi_join(full_count, by = "sample_id") %>% 
+#   select(1) %>%
+#   write_tsv(paste0(basedir, "/sample_lists/bam_list_realigned_smb_anchored_mincov_filtered.txt"), col_names = F)
+# 
+# ## sample table (this is the same as the one used with the gadMor2)
+# read_tsv(paste0(basedir, "/sample_lists/sample_table_merged_smb_anchored.tsv")) %>% 
+#   semi_join(full_count, by = c("sample_id_corrected" = "sample_id")) %>% 
+#   write_tsv(paste0(basedir, "/sample_lists/sample_table_merged_smb_anchored_mincov_filtered.tsv"), col_names = T)
+```
+
+## Summary statistics
+
+Read in the data
+```{r eval=TRUE, message=FALSE, warning=FALSE}
+per_position_per_ind <- read_tsv(paste0(basedir,"/sample_lists/bam_list_realigned_smb_anchored_mincov_filtered_depth_per_position_per_sample_summary.tsv"))
+depth_hist <- read_tsv(paste0(basedir,"/sample_lists/bam_list_realigned_smb_anchored_mincov_filtered_depth_per_position_all_samples_histogram.tsv"))
+presence_hist <- read_tsv(paste0(basedir,"/sample_lists/bam_list_realigned_smb_anchored_mincov_filtered_presence_per_position_all_samples_histogram.tsv"))
+
+arrange(per_position_per_ind, desc(mean_depth))
+
+per_position_per_ind %>% 
+  filter(str_detect(str_sub(sample_seq_id, 1,1), 'A|D')) %>% 
+  summarise(maxdp = max(mean_depth),
+            mindp = min(mean_depth),
+            mmaxref = max(proportion_of_reference_covered),
+            minref = min(proportion_of_reference_covered))
+```
+
+The mean depth per position across all individuals is `r round(sum(depth_hist$by*depth_hist$n)/sum(depth_hist$n),2)`, and the standard deviation is `r sqrt(sum((depth_hist$by-254.58)^2*depth_hist$n)/sum(depth_hist$n))`.
+
+A total of `r sum(filter(depth_hist, by>0)$n)` sites were covered at least once. This is `r round(sum(filter(depth_hist, by>0)$n)/sum(depth_hist$n)*100,2)`% of the reference genome. 
+
+Number of mapped bases vs. Proportion of reference covered
+```{r eval=TRUE, message=FALSE, warning=FALSE}
+ggplot(per_position_per_ind) +
+  geom_point(aes(x=mean_depth, y=proportion_of_reference_covered)) +
+  theme_cowplot()
+```
+
+## Design filters for SNP calling
+
+```{r eval=TRUE, message=FALSE, warning=FALSE}
+## Super low and super high coverage sites are cut from this figure
+filter(depth_hist, by>0, by<700) %>%
+  ggplot(aes(x=by, y=n)) +
+  geom_freqpoly(stat = "identity") +
+  theme_cowplot()
+
+## 176 is the mode of the second peak
+filter(depth_hist, by>10) %>%
+  arrange(by=n) %>%
+  tail(n=1)
+
+## 39 is the first trough
+filter(depth_hist, by<176) %>% # by<x, where x = mode of the second peak
+  arrange(by=n) %>%
+  head(n=1)
+
+max_depth <- 350 # try and get this so that it makes the depth a normal distribution
+paste0('If MaxDepth=', max_depth, ' filter is used, ', round(sum(filter(depth_hist, by>max_depth)$n)/sum(depth_hist$n)*100,2), '% of all sites and ', round(sum(filter(depth_hist, by>max_depth)$n*filter(depth_hist, by>max_depth)$by)/sum(depth_hist$n*depth_hist$by)*100,2), '% of the final mapped data will be lost')
+
+min_depth <- 39 # Set this to be the first trough
+paste0('If minDepth=', min_depth, ' filter is used, ', round(sum(filter(depth_hist, by<min_depth)$n)/sum(depth_hist$n)*100,2), '% of all sites and ', round(sum(filter(depth_hist, by<min_depth)$n*filter(depth_hist, by<min_depth)$by)/sum(depth_hist$n*depth_hist$by*100,2)), '% of the final mapped data will be lost')
+
+## If these filters are used
+filter(depth_hist, by>1, by<700) %>%
+ggplot(aes(x=by, y=n)) +
+  geom_freqpoly(stat = "identity") +
+  geom_vline(xintercept = c(max_depth,min_depth), color="red") +
+  theme_cowplot()
+```
+
+#### Per position presence summed across all individuals
+
+```{r eval=TRUE, message=FALSE, warning=FALSE}
+## First trough is at n=21
+filter(presence_hist, by<100) %>%
+  arrange(n) %>%
+  head(n=1)
+## If MinInd=21 filter is applied 
+filter(presence_hist, by>0) %>%
+ggplot(aes(x=by, y=n)) +
+  geom_freqpoly(stat = "identity") +
+  geom_vline(aes(xintercept = 21 ), color="red") +
+  theme_cowplot()
+## The following is proportion of sites filtered out
+filter(presence_hist, by<21) %>%
+  .$n %>%
+  sum()/826000000
+```
+
+Thus, we will attempt a first SNP calling with MinDepth=39, MaxDepth=350, MinInd=21, with **only the 191 individuals that passed the minimum coverage filter** (`bam_list_realigned_mincov_filtered.txt`). 

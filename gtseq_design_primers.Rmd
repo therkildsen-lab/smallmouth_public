@@ -1,0 +1,582 @@
+### Import packages and setwd
+```{r message=F, warning=F}
+library(tidyverse)
+library(cowplot)
+library(ape)
+library(pegas)
+library(RColorBrewer)
+library(knitr)
+# library(insect)
+# library(RcppCNPy)
+library(scales)
+# library(ggpubr) # for ggarrange, putting multiple graphs on the same plot
+# library(ggpmisc) # put formula on ggplot
+library(Biostrings) # fasta in R
+library(seqinr) # fasta in R
+library(jsonlite) # MFEprimer exports in JSON, so need to import those results
+source("/workdir/genomic-data-analysis/scripts/individual_pca_functions.R")
+library(xlsx)
+
+# install.packages(c('insect','RcppCNPy','ggpubr'))
+
+setwd('/workdir/smallmouth')
+
+# Import our chromosome names
+lg_filter <- read_csv('/workdir/smallmouth/sample_lists/lg_reference_annotate.csv')
+
+ChrLength <- read_tsv('/workdir/smallmouth/genome/smb_anchored/smb_anchored_chrs.fasta.fai',
+                      col_names = c('chr', 'length')) %>% 
+              dplyr::select(chr,length)
+
+lg_filter <- left_join(lg_filter,ChrLength,by='chr')
+
+# bring in average maf for A and D
+  maf_D<-as_tibble(read.table(gzfile(paste0('/workdir/smallmouth/angsd/popminind20/D_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.mafs.gz')), header = TRUE)) %>% 
+    filter(between(knownEM, 0.005, 0.995)) %>% 
+    dplyr::select(chr=chromo, snp_position=position, mafD=knownEM)
+  maf_A<-as_tibble(read.table(gzfile(paste0('/workdir/smallmouth/angsd/popminind20/A_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.mafs.gz')), header = TRUE)) %>% 
+    filter(between(knownEM, 0.005, 0.995)) %>% 
+    dplyr::select(chr=chromo, snp_position=position, mafA=knownEM)
+  maf_A_D<-
+    full_join(maf_D, maf_A, by=c('chr','snp_position')) %>% 
+    pivot_longer(!c(chr, snp_position), names_to='pop', values_to='maf') %>% 
+    #filter(!is.na(maf)) %>% 
+    group_by(chr, snp_position) %>% 
+    summarise(mean_af=mean(maf, na.rm=T)) %>% 
+    left_join(maf_D, by=c('chr','snp_position')) %>% 
+    left_join(maf_A, by=c('chr','snp_position'))
+
+pop_order<-read_csv('/workdir/smallmouth/sample_lists/pop_order.csv')
+
+sample_table<-read_tsv("/workdir/smallmouth/sample_lists/sample_table_merged_smb_anchored_mincov_filtered.tsv") %>%
+  left_join(pop_order, by='population')
+
+```
+
+
+
+### First round of primer design
+
+Iterate through all desired regions to design primers with primer3 (ask it to give several options) - give as wide of a window as possible on either side of the regions as possible. Will have to avoid other SNPs (see Diana's note). Also try and make the products as close to eachother as possible to avoid uneven amplification - within 100bp at the very leas. use primer3 to pick primers (avoid SNPs)
+
+
+TO DO IN THE FUTURE ###################################################################
+
+** Note for next time - prob should limit primers to 59-62 instead of 58
+
+**decrease poly-x repeat. do higher perc of poly-x repeats lead to higher prob of failure?  set PRIMER_MAX_POLY_X= to less than 4, maybe 2, or 1
+
+```{r} 
+# import parentage and adaptive panel, as well as potential sex determination markers
+    parentage<-read_csv('/workdir/smallmouth/gtseq/parentage_panel_noncod_refbias_minmaf_fst_hwe_microhap_noN_nonrepetitive_positions_genotypes_haploScore_pruned.csv') %>% 
+  dplyr::select(chr, microhap_name, position)
+
+    adaptive<-read_csv('/workdir/smallmouth/gtseq/adaptive_loci.csv') %>%
+      mutate(name=as.double(name)) %>% 
+      left_join(lg_filter, by=c('name')) %>% 
+      dplyr::select(chr, microhap_name, position=pos)
+    
+    sex<-read_csv('/workdir/smallmouth/gtseq/sex_determination_regions.csv') %>% 
+      dplyr::select(chr, microhap_name, position=pos)
+    
+    parentage_adaptive<-bind_rows(parentage,adaptive, sex) %>% 
+                        mutate(fasta_start=position-200,
+                               fasta_end=position+200) %>% 
+      filter(!duplicated(microhap_name), # just in case we duplicated any loci
+             fasta_start>100) # give us enough room for primers
+    
+  # develop fasta for adaptive, re-developing them for parentage (I could import, but this is cleaner)
+    fasta_smb = readDNAStringSet('/workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta')
+    adaptive_parentage_fasta<-tibble()
+    for(i in 1:nrow(parentage_adaptive)){
+      #i<-1
+      chrom<-as.character(parentage_adaptive[i,1])
+      start_pos<-as.integer(parentage_adaptive[i,3]-200)
+      end_pos<-as.integer(parentage_adaptive[i,3]+200)
+      microhap_name<-parentage_adaptive[i,2]
+      fasta_chr<-fasta_smb[chrom]
+      fasta_chr_sequence<- tibble(microhap_sequence=toString(subseq(fasta_chr, start = start_pos, end = end_pos)))
+      sequence_names_in<-bind_cols(microhap_name,fasta_chr_sequence)
+      adaptive_parentage_fasta<-bind_rows(sequence_names_in,adaptive_parentage_fasta)
+    }
+    
+    # Just do a quick check to make sure that we don't have any N's. This should be a tibble with no N's
+    adaptive_parentage_fasta %>% 
+      filter(str_detect(adaptive_parentage_fasta$microhap_sequence, 'N'))
+
+# identify where the first and last SNP of interest are within the 250bp fragment from the center of the fasta
+    # filter the SNP list for the snps between the pos_start and pos_end
+    full_position_out<-tibble()
+    for(i in 1:nrow(parentage_adaptive)){
+      full_position_in<-maf_A_D %>%
+        filter(chr==parentage_adaptive$chr[i], between(snp_position, parentage_adaptive$fasta_start[i]+75, parentage_adaptive$fasta_end[i]-75)) %>%
+        mutate(microhap_name=parentage_adaptive$microhap_name[i],
+               pos_start=parentage_adaptive$fasta_start[i],
+               pos_end=parentage_adaptive$fasta_end[i],
+               relative_position=snp_position-pos_start) %>%  # take the relative position of each SNP in the fragment
+        dplyr::select(microhap_name, chr, pos_start, pos_end, snp_position, relative_position, mean_af)
+
+      full_position_out<-bind_rows(full_position_out, full_position_in)
+    }
+
+  # Next step is to calculate where we should point the primer software to start and end the fragment. If the distance between SNPs is too great, or the first or last SNPs are too close to the edge of our fasta, just plug in a basic start/stop (100,300). Will have to look through this later to check there aren't SNPs too close to the 3' end of the primer
+    
+primer3_regions<-full_position_out %>%
+  group_by(microhap_name) %>%
+  summarise(sequence_target_start=min(relative_position)-2,
+            last_snp=max(relative_position)) %>%
+  mutate(sequence_target_length=last_snp-sequence_target_start+2) %>%
+  left_join(parentage_adaptive, by='microhap_name') %>% 
+  dplyr::select(-last_snp)
+
+# Manually add the read depth ones - we don't have any SNPs to target. Since I can manually add the sequence target, I can use the long putative indel as well. but i have enough, so not adding now
+
+primer3_regions<-parentage_adaptive %>% 
+  filter(str_detect(microhap_name, 'sex_read_depth')) %>% 
+  left_join(read_csv('/workdir/smallmouth/gtseq/sex_determination_regions.csv'), by=c('chr','microhap_name')) %>% 
+  mutate(sequence_target_start=pos_start-fasta_start,
+         sequence_target_length=(pos_end-pos_start)) %>% 
+  dplyr::select(microhap_name, sequence_target_start, sequence_target_length, chr, position, fasta_start, fasta_end) %>% 
+  bind_rows(primer3_regions)
+
+# build the file for primer3 to iterate over, giving a 2bp window on either side of the last SNPs
+for(i in 1:nrow(primer3_regions)){
+  script<-paste0("SEQUENCE_ID=",primer3_regions[i,]$microhap_name,"
+SEQUENCE_TEMPLATE=",filter(adaptive_parentage_fasta, microhap_name==primer3_regions[i,]$microhap_name)$microhap_sequence,"
+SEQUENCE_TARGET=",primer3_regions[i,]$sequence_target_start,",",primer3_regions[i,]$sequence_target_length,"
+PRIMER_PICK_LEFT_PRIMER=1  
+PRIMER_PICK_RIGHT_PRIMER=1  
+PRIMER_OPT_SIZE=20  
+PRIMER_MIN_SIZE=17  
+PRIMER_MAX_SIZE=23  
+PRIMER_PRODUCT_SIZE_RANGE=190-290  
+PRIMER_PRODUCT_OPT_SIZE=260  
+PRIMER_MIN_TM=58  
+PRIMER_MAX_TM=62  
+PRIMER_OPT_TM=60  
+PRIMER_MAX_HAIRPIN_TH=50  
+PRIMER_MAX_GC=70 
+PRIMER_MIN_GC=30  
+PRIMER_OPT_GC_PERCENT=50  
+PRIMER_MAX_POLY_X=4  
+PRIMER_NUM_RETURN=5
+=")
+  
+  write_lines(script, paste0('/workdir/smallmouth/gtseq/primers/primer3_input/',primer3_regions[i,]$microhap_name,'.txt'))
+}
+
+# write the list of microhap names to iterate over
+write_lines(primer3_regions$microhap_name, '/workdir/smallmouth/gtseq/primers/microhap_names.txt')
+
+# write the microhap regions file
+write_csv(primer3_regions,'/workdir/smallmouth/gtseq/adaptive_parentage_primer3_regions.csv')
+
+# write the insert fasta - helpful for developing genotyping probes downstream
+write_csv(adaptive_parentage_fasta,'/workdir/smallmouth/gtseq/adaptive_parentage_sex_fasta.csv')
+```
+
+actually run primer3 - iterate over all regions
+```{bash}
+cd /workdir/smallmouth/gtseq/primers/primer3_output
+rm *
+module load gcc/10.2.0
+bash /workdir/smallmouth/gtseq/primers/run_primer3.sh
+```
+
+clean and save the primer3 output
+```{r, message=F, warning=F, results='hide'}
+# import primer3 results
+regions<-read_csv('/workdir/smallmouth/gtseq/adaptive_parentage_primer3_regions.csv')
+
+primer3_out<-tibble()
+primer3_errors<-tibble()
+for(i in regions$microhap_name){
+  tryCatch({
+  primer3_in<-read_csv(paste0('/workdir/smallmouth/gtseq/primers/primer3_output/',i,'.txt'), col_names = 'input', show_col_types = FALSE) %>% 
+    separate(input, c('factor','value'), sep = '=') %>% 
+    filter(factor=='SEQUENCE_ID' |
+           str_detect(factor,'PRIMER_LEFT') & str_detect(factor,'SEQUENCE') |
+           str_detect(factor,'PRIMER_RIGHT') & str_detect(factor,'SEQUENCE') |
+           str_detect(factor,'PRIMER_RIGHT') & nchar(factor)<15 |
+           str_detect(factor,'PRIMER_LEFT') & nchar(factor)<14) %>% 
+    mutate(side=if_else(str_detect(factor, 'RIGHT'), 'RIGHT',
+                if_else(str_detect(factor, 'LEFT'), 'LEFT', 'NA')),
+           factor=str_replace(factor, 'PRIMER_PAIR_',''),
+           factor=str_replace(factor, 'PRIMER_LEFT_',''),
+           factor=str_replace(factor, 'PRIMER_RIGHT_','')) %>% 
+    filter(factor!='SEQUENCE_ID') %>% 
+    separate(factor, c('primer_n', 'factor'), sep='_') %>% 
+    mutate(factor=if_else(is.na(factor), 'LOCATION', factor)) %>% 
+    mutate(factor_side=paste0(factor,'_',side)) %>% 
+    pivot_wider(!c(factor,side), names_from = factor_side, values_from = value) %>% 
+    separate(LOCATION_LEFT, into=c('left_primer_start', 'left_primer_length'), sep=',') %>% 
+    separate(LOCATION_RIGHT, into=c('right_primer_start', 'right_primer_length'), sep=',') %>% 
+        mutate(microhap_name=i)
+
+  primer3_out<-bind_rows(primer3_out, primer3_in)
+  },
+    error = function(e) {
+    primer3_errors<-bind_rows(tibble(problem=i), primer3_errors)
+  })
+  
+}
+
+# How many regions worked?
+primer3_out %>% 
+  group_by(microhap_name) %>% 
+  summarise(n=n()) %>% 
+  mutate(primer_type=if_else(str_detect(microhap_name, 'adaptive'), 'adaptive',
+                     if_else(str_detect(microhap_name, 'parentage'), 'parentage', 'sex'))) %>% 
+  group_by(primer_type) %>% 
+  summarise(n=n()) # manually count if we still have the gwas hits, lg19, lg6, and lg7
+
+# export the consolidated primer3 output
+write_csv(primer3_out, '/workdir/smallmouth/gtseq/primers/primer3_output_consolidated.csv')
+```
+
+### exclude any of the 5 primer options that have SNPs within the first 5bp of the 3' end
+
+#### trying in R - takes a while, so I have it running in bash
+```{bash}
+nohup Rscript /workdir/smallmouth/scripts/gtseq_design_primers_exclude_snp.R &
+```
+
+```{r}
+primer3_out_nosnp<-read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp.csv')
+
+# how many regions do we have left? 215, still have 6 sex regions, 3 gwas hits, 30 lg19, 8 lg6, 8 lg7
+unique(primer3_out_nosnp$microhap_name)
+```
+
+#### # also try the mfeprimer bed file
+```{r}
+mfe_test<-primer3_out %>% 
+  dplyr::select(microhap_name, SEQUENCE_LEFT, SEQUENCE_RIGHT) %>% 
+  pivot_longer(!microhap_name, names_to = 'side',values_to='sequence') %>% 
+  mutate(ID=paste0(microhap_name, side))
+write.fasta(sequences = as.list(mfe_test$sequence), names = as.list(mfe_test$ID), file.out = '/workdir/smallmouth/gtseq/primers/mfeprimer/input.fasta')
+
+# make bed file
+maf_A_D %>% 
+  mutate(snp_position2=snp_position) %>% 
+  dplyr::select(chr, snp_position, snp_position2) %>% 
+  write_tsv('/workdir/smallmouth/gtseq/primers/mfeprimer/snp.bed',col_names = F)
+```
+
+```{bash}
+nohup /programs/mfeprimer-3.2.6/mfeprimer -d /workdir/smallmouth/genome/smb_anchored/smb_anchored.fasta -i /workdir/smallmouth/gtseq/primers/mfeprimer/input.fasta -c 30 -t 50 -S 600 -j --snp /workdir/smallmouth/gtseq/primers/mfeprimer/snp.bed --misMatch 0 -o /workdir/smallmouth/gtseq/primers/mfeprimer/output_test.out & 
+```
+
+### exclude any of the 5 primer options that show hairpins when illumina sequences are annealed
+
+set things up for mfeprimer
+```{r}
+input<-read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp.csv') %>% 
+  mutate(`F`=paste0('CTACACGTTCAGAGTTCTACAGTCCGACGATC',SEQUENCE_LEFT),
+         R=paste0('GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCT',SEQUENCE_RIGHT),
+         ID=paste0(microhap_name,'_primer',primer_n))
+
+# stop here to export the hairpin names
+write_csv(input, '/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq.csv')
+
+hairpin_run<-input %>% 
+  dplyr::select(ID,`F`, R) %>% 
+  pivot_longer(!ID, names_to='side',values_to='sequence') %>% 
+  mutate(ID=paste0(ID, '_',side))
+
+write.fasta(sequences = as.list(hairpin_run$sequence), names = hairpin_run$ID, file.out = '/workdir/smallmouth/gtseq/primers/hairpin/input.fasta')
+```
+
+run MFEprimer. hairpin -i (input fasta) -0 (output file) -j (export in json, easier to parse), -c (threads)
+```{bash}
+/programs/mfeprimer-3.2.6/mfeprimer hairpin -i /workdir/smallmouth/gtseq/primers/hairpin/input.fasta -o /workdir/smallmouth/gtseq/primers/hairpin/output.txt -j -c 20
+```
+
+Just exclude any that show up as having a potential hairpin, regardless of Tm
+```{r}
+no_hairpin<-
+  jsonlite::fromJSON('/workdir/smallmouth/gtseq/primers/hairpin/output.txt.json', simplifyDataFrame = T, flatten = T) %>% 
+  separate(Seq.ID, into=c('microhap_name', 'primer_n_side'), sep='_primer') %>% 
+  separate(primer_n_side, into=c('primer_n', 'side'), sep='_') %>% 
+  mutate(primer_n=as.double(primer_n)) %>% 
+  dplyr::select(microhap_name, primer_n, hairpin_tm=Tm) %>% 
+  right_join(read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq.csv'), by=c('microhap_name','primer_n')) %>% 
+  filter(is.na(hairpin_tm)) %>% 
+  dplyr::select(-hairpin_tm)
+
+  write_csv(no_hairpin,'/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin.csv')
+  
+  # 213 remaining, 6 sex regions, 3 gwas, 30 lg19, 8 lg6, 9 lg7
+  unique(no_hairpin$microhap_name)
+```
+
+### test for offtarget amplification
+
+
+
+
+
+***** Note - maybe I should change the max amplicon length, based off the bead ratio changes. If I do a 0.4 or 0.3 bead ratio, that increases the window for offtarget amplification****
+
+
+```{r}
+prep_thermo<-
+  read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin.csv') %>% 
+  dplyr::select(ID, SEQUENCE_LEFT, SEQUENCE_RIGHT)
+
+# go and remove all the files in thermonucblastin and out
+
+for(i in 1:nrow(prep_thermo)){
+  write_tsv(prep_thermo[i,], paste0('/workdir/smallmouth/gtseq/primers/thermonucblast/in/',prep_thermo[i,]$ID,'.tsv'), col_names = F)
+}
+
+prep_thermo$ID %>% 
+  write_lines('/workdir/smallmouth/gtseq/primers/thermonucblast/input_data.tsv')
+
+```
+
+run thermonucleotideblast with a Tm value (-e) of 50, maximum primer delta (-g) -5 and a max amplicon length (-I) of 700. This will take over the whole server for a while (n=707 pairs ran for 1 hour) - make sure no one else is running anything. Need to keep my cmd browser open, even though I'm running nohup, it still cancels for some reason
+```{bash}
+module load gcc/10.2.0
+
+for test in `cat /workdir/smallmouth/gtseq/primers/thermonucblast/input_data.tsv`; do 
+  nohup bash /workdir/smallmouth/gtseq/primers/run_thermonuc.sh $test > /workdir/smallmouth/nohups/thermonuc$test.nohup &
+done
+```
+
+Import thermonucleotideblast outputs and exclude primer pairs based on off-target amplification
+```{r}
+output<-tibble()
+for(i in list.files('/workdir/smallmouth/gtseq/primers/thermonucblast/out/')){
+   incoming<-read_tsv(paste0('/workdir/smallmouth/gtseq/primers/thermonucblast/out/',i), col_names = 'ID')
+  name<-incoming[2,] %>% 
+    mutate(ID=str_replace(ID, 'name = ',''),
+           offtarget=if_else(length(incoming$ID)<40,0,1),
+           bp_range=as.character(incoming[24,]),
+           amplicon_chr=as.character(incoming[35,]))
+  output<-bind_rows(name, output)
+}
+
+# exclude the offtarget amplifications, then confirm that we are amplifying to the correct place
+output_joined<-
+  output %>% 
+  filter(offtarget==0 | str_detect(ID, 'sex_read')) %>% # keep some offtarget regions if they code for sex (otherwise removes all of them)
+  separate(ID, into = c('microhap_name','primer_n'), sep = '_primer') %>% 
+  mutate(primer_n=as.double(primer_n),
+         bp_range=str_replace(bp_range, 'amplicon range = ', ''),
+         amplicon_chr=str_replace(amplicon_chr, '>','')) %>% 
+  separate(bp_range, into=c('amplicon_start','amplicon_end'), sep = ' .. ') %>% 
+    mutate(amplicon_start=as.double(amplicon_start),
+           amplicon_end=as.double(amplicon_end)) %>% 
+    left_join(read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin.csv'), by = c('microhap_name','primer_n')) %>%  # add the current working database
+    left_join(dplyr::select(read_csv('/workdir/smallmouth/gtseq/adaptive_parentage_primer3_regions.csv'), c(microhap_name, chr, position)), by='microhap_name') %>% # add the position and chromosome we are targeting
+    filter(amplicon_chr==chr & position > amplicon_start-50 & position < amplicon_end+50) # give us a bit of buffer on either side
+  
+unique(output_joined$microhap_name) # we've got 203 primer pairs now
+
+output_joined %>% 
+  dplyr::select(ID, microhap_name, primer_n, chr, position, SEQUENCE_LEFT, SEQUENCE_RIGHT, `F`, R) %>% 
+  write_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget.csv')
+```
+
+### Check for homodimers and heterodimers for all possible primer pairs, excluding bad ones
+
+```{r}
+full_list<-read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget.csv')
+
+# double-check that no sequence is longer than 60bp. We are all good
+max(nchar(full_list$`F`))
+max(nchar(full_list$R))
+
+# First, just grab the best primer pair for each region. I can just use group by and   slice_min(n = 1, commonness) see hudson.Rmd
+
+full_list_out<-tibble()
+for(i in unique(full_list$microhap_name)){
+  working<-full_list %>% 
+    filter(microhap_name==i)
+  
+  working_in<-filter(working, primer_n==min(working$primer_n))
+  full_list_out<-bind_rows(working_in, full_list_out)
+}
+
+test_mfs<-
+  full_list_out %>% 
+  dplyr::select(ID, `F`, R) %>% 
+  pivot_longer(!ID, names_to='side',values_to='FullSeq') %>% 
+  mutate(ID=paste0(ID, '_',side)) 
+  
+write.fasta(sequences = as.list(test_mfs$FullSeq), names = as.list(test_mfs$ID), file.out = '/workdir/smallmouth/gtseq/primers/mfeprimer/input1.fasta')
+write_csv(test_mfs,'/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget_pool1.csv')
+write_csv(full_list, '/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget_allregions1.csv')
+```
+
+```{bash}
+/programs/mfeprimer-3.2.6/mfeprimer dimer -i /workdir/smallmouth/gtseq/primers/mfeprimer/input1.fasta -c 30 -j -o /workdir/smallmouth/gtseq/primers/mfeprimer/output_test1.out
+```
+      
+Test what a good deltaG value should be - I still get lots of potential dimers with deltaG above 8. so I think it's helpful but not necessary to run this test. I could also just use a more conservative threshold (7?) in the future
+```{r}
+# first, run mfeprimer on my dimer-cleaned list of primers (n=112)
+    cleaned_pool<-read_csv('/workdir/smallmouth/gtseq/all_regions_primers_ordered.csv') %>% 
+      dplyr::select(c(microhap_name, `F`, `R`)) %>% 
+      pivot_longer(-microhap_name, names_to = 'direction', values_to = 'seq') %>% 
+      mutate(microhap_name = paste0(microhap_name, '_',direction))
+    
+    write.fasta(sequences = as.list(cleaned_pool$seq), names = as.list(cleaned_pool$microhap_name), file.out = '/workdir/smallmouth/gtseq/primers/mfeprimer/pool_after_optimization.fasta')
+    
+    # run this in cmd: /programs/mfeprimer-3.2.6/mfeprimer dimer -i /workdir/smallmouth/gtseq/primers/mfeprimer/pool_after_optimization.fasta -c 30 -j -o /workdir/smallmouth/gtseq/primers/mfeprimer/output_pool_after_optimization.out
+
+# look at the deltaG valus of the primers I ended up excluding
+jsonlite::fromJSON('/workdir/smallmouth/gtseq/primers/mfeprimer/output_test10.out.json', simplifyDataFrame = T, flatten = T)
+
+# look at the max deltaG of the dimer-cleaned pool (8) vs the naive pool (1)
+jsonlite::fromJSON('/workdir/smallmouth/gtseq/primers/mfeprimer/output_test10.out.json', simplifyDataFrame = T, flatten = T)
+jsonlite::fromJSON('/workdir/smallmouth/gtseq/primers/mfeprimer/output_pool_after_optimization.out', simplifyDataFrame = T, flatten = T)
+
+# export for primerPoolerr
+
+```
+
+import the list of dimer-causing sequences
+The way this works is to set the Dg level (-8, -7, -6, ect) - set this to the most conservative that I can actually keep a nice number of primers
+
+make a new recording_success tibble (and then comment again), then run through several pools, running the pasted bash script each time. after 5-7 rounds, check the ggplot to see how many loci we get. 5 rounds seems to be enough to filter out most of the bad ones and get an asymptote. with a dg of -8 I get n=196 loci, dg -7 I get 192, and dg -6 I get 176. order the ones with the dg -8, then see if the ones we drop get flagged by a different dg filter
+```{r}
+# recording_success<-tibble() # Only uncomment this for the first go-around
+
+pool<-10
+
+full_list<-read_csv(paste0('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget_allregions',pool,'.csv'))
+
+previous_pool<-read_csv(paste0('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget_pool',pool,'.csv'))
+
+# Make a list of the bad sequences
+ baddies<- jsonlite::fromJSON(paste0('/workdir/smallmouth/gtseq/primers/mfeprimer/output_test',pool,'.out.json'), simplifyDataFrame = T, flatten = T) %>%
+  filter(Dg < -8 | Tm > 50) %>% 
+   dplyr::select(S1.ID)
+
+# Remove the bad sequences from the full list
+remove<-baddies %>% 
+  separate(S1.ID, into=c('microhap_name', 'primer_n_side'), sep='_primer') %>% 
+  separate(primer_n_side, into=c('primer_n', 'side'), sep='_') %>% 
+  mutate(ID=paste0(microhap_name, '_primer',primer_n)) %>% 
+    dplyr::select(ID) %>% 
+   filter(!duplicated(ID))
+  
+full_list <-  anti_join(full_list, remove)
+
+# export the new full list
+write_csv(full_list,paste0('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget_allregions',pool+1,'.csv'))
+
+# Take the best primer for each locus
+full_list_out<-tibble()
+for(i in unique(full_list$microhap_name)){
+  working<-full_list %>% 
+    filter(microhap_name==i)
+  
+  working_in<-filter(working, primer_n==min(working$primer_n))
+  full_list_out<-bind_rows(working_in, full_list_out)
+}
+
+test_mfs<-
+  full_list_out %>% 
+  dplyr::select(ID, `F`, R) %>% 
+  pivot_longer(!ID, names_to='side',values_to='FullSeq') %>% 
+  mutate(ID=paste0(ID, '_',side)) 
+
+# write fasta
+write.fasta(sequences = as.list(test_mfs$FullSeq), names = as.list(test_mfs$ID), file.out = paste0('/workdir/smallmouth/gtseq/primers/mfeprimer/input',pool+1,'.fasta'))
+
+# write new pool
+write_csv(test_mfs,paste0('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget_pool',pool+1,'.csv'))
+
+# record the pool number and the number of loci which made it through the pooling scheme
+recording_success<-bind_rows(recording_success, tibble(iteration=pool, successful_loci=nrow(anti_join(previous_pool, dplyr::rename(filter(baddies, !duplicated(S1.ID)), ID=S1.ID)))/2))
+
+recording_success %>% 
+  ggplot(aes(iteration, successful_loci)) +
+  geom_line()
+
+# paste the new bash script into cmd
+paste0('/programs/mfeprimer-3.2.6/mfeprimer dimer -i /workdir/smallmouth/gtseq/primers/mfeprimer/input',pool+1,'.fasta -c 30 -j -o /workdir/smallmouth/gtseq/primers/mfeprimer/output_test',pool+1,'.out')
+
+
+```
+
+### Export primer list to order in IDT plate format (wet)
+
+I was going to give the mixed primers a shot, but it would be the same cost for half the product, as we still ahve to pay for each primer nucleotide (just paying for ~110 nucleotides per well instead of just ~55)
+```{r}
+final_list<-read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget_pool10.csv')
+
+# Make some new names so its easier to deal with in the lab
+final_list<-tibble(num=rep(1:as.integer(nrow(final_list)/2), each=2)) %>% 
+  bind_cols(final_list) %>% 
+  mutate(name=paste0(num, '_', side))
+
+# Write out the easy names
+write_csv(final_list, '/workdir/smallmouth/gtseq/primers/primer3_output_consolidated_nosnp_fullseq_nohairpin_noofftarget_pool10_easy_names.csv')
+
+# Spot check a few primer pairs on primerblast to make sure things look good, removing the illumina adapter part first
+final_list %>% 
+  mutate(primerblast_check=str_replace(FullSeq, 'CTACACGTTCAGAGTTCTACAGTCCGACGATC',''),
+         primerblast_check=str_replace(primerblast_check, 'GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCT',''))
+
+# Just a quick double-check that the primers are the same as when we started. Manually paste in ID to compare using sticky note
+read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated.csv') %>% 
+  mutate(ID = paste0(microhap_name, '_primer',primer_n)) %>% 
+  filter(str_detect(ID, 'adaptive_lg19_29470838_primer0'))
+
+# what is our expected amplicon size range? This will be useful for deciding on bead ratio
+read_csv('/workdir/smallmouth/gtseq/primers/primer3_output_consolidated.csv') %>% 
+  mutate(ID = paste0(microhap_name, '_primer', primer_n, '_F'),
+         amplicon_length_unbarcoded = right_primer_start-left_primer_start) %>% 
+  right_join(final_list, by = 'ID') %>% 
+  filter(!is.na(amplicon_length_unbarcoded)) %>% 
+  mutate(amplicon_length_barcoded = amplicon_length_unbarcoded+136) %>% 
+  ggplot(aes(amplicon_length_barcoded)) +
+  geom_histogram()
+            
+# how many plates? 
+length(final_list$ID)/96
+
+# Make the well list
+well_out<-tibble()
+for(row in LETTERS[1:8]){
+  for(column in 1:12){
+    well_out<-bind_rows(well_out, tibble(Well=paste0(row,column)))
+  }
+}
+
+for(plate in 0:3){
+  start<-1+(96*plate)
+  end<-start+95
+  output<-final_list[start:end,] %>% 
+    bind_cols(well_out) %>% 
+    dplyr::select(`Well Position`=Well, `Sequence Name`=name, Sequence=FullSeq) %>% 
+    as.data.frame()
+  write.xlsx(output, file = paste0('/workdir/smallmouth/gtseq/primers/plate',plate,'.xlsx'), sheetName = paste0('plate',plate), row.names=F)
+}
+
+# delete any empty cells (like at the end)
+```
+Make sure to order them at full yield
+25nM should be plenty for each primer
+order it diluted to 100uM in IDTE
+
+Dilute to 250nM per primer. nM is 1e-9 M/L, or 1e-15 M/uL, therefore 2.5e2 nM = 2.5e-13 M/uL
+If MW is ~ 35,000, then this is 2.5e-13 M/uL * 3.5e4 daltons (g/mol) = 8.75e-9 g/uL
+1g = 1e9 ng, so 8.75e-9 g/uL = 8.75ng/uL
+If we use 1.5uL pooled primer mix (0.75uL / primer) per well, then this is 8.75ng/uL * 0.75uL = 6.5625ng 
+Finally, if we are ordering 25nM, and 1 mole = 1e-9 nmole
+
+Ok the above was too confusing, but good to save. Restarting here
+25nmole diluted to 250nM (nmole/L) will yield 25 nmol / 250 = 0.1 L, or 10e5 uL
+If we are using 0.75uL primer / well, this is 10e5 / 0.75 = 
+
+From https://www.biosearchtech.com/support/faqs/fluorogenic-probe-and-primers/how-many-pcr-reactions-will-i-be-able-to-run-with-my-probe-or-primer
+1nmol is 100 reactions at 300nM and 20uL
+1nmol is 2,666 reactions at 300nM and 0.75uL
+1nmol is 3,200 reactions at 250nM and 0.75uL
+25nmol is 79,980 reactions at 250nM and 0.75uL
+*If we combine the F and R primers, we can get ~40k reactions out of 25nmol if pooled primer stock*
