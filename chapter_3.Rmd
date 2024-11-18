@@ -326,6 +326,7 @@ ordered_amplicons<-read_csv('/workdir/smallmouth/gtseq/all_regions_primers_order
              fam_index = as.double(as.factor(fam_index)))
     
 loci_selected<-c('adaptive_lg19_12740897-pos201', 'adaptive_lg6_3256886-pos201') #, 'adaptive_lg7_25601423-pos157')
+
 ```
 
 # Quality control
@@ -394,8 +395,6 @@ loci_selected<-c('adaptive_lg19_12740897-pos201', 'adaptive_lg6_3256886-pos201')
 
 
 ## Genotyping accuracy
-
-
 ```{r, warning=F, message=F, error=F, echo=F}
 
 # here I want to import the non-read-depth cleaned version of genos
@@ -427,10 +426,6 @@ dups_filt<-read_xlsx('/workdir/smallmouth/gtseq/results/gtseq_produciton_2_1_dup
 
   tib_out<-tibble()
   tib_out_snp<-tibble()
-  
-  i<-1
-  rd<-10
-  miss<-0.4
   
     for(rd in c(5,10,15,20)){
       
@@ -529,8 +524,6 @@ dups_filt<-read_xlsx('/workdir/smallmouth/gtseq/results/gtseq_produciton_2_1_dup
      
 ```
 
-
-
 ## Null alleles (both adaptive and neutral)
 
 ### popgenreport
@@ -614,7 +607,7 @@ overall_zscore %>%
     #   filter(Pr.exact < hwe_alpha | `Pr(chi^2 >)` < hwe_alpha)
 
 # let's check per population - exclude loci that fail HWE in more than 50% of years
-    obj_hwe<-seppop(obj_noFams) %>% 
+    obj_hwe<-seppop(obj) %>% 
       lapply(pegas::hw.test, B = 0)
 
     obj_hwe_pval<-sapply(obj_hwe, "[", i = TRUE, j = 3)
@@ -629,12 +622,9 @@ overall_zscore %>%
       filter(!is.na(hwe_1yes)) %>% 
       group_by(locus) %>% 
       summarise(sum_in_hwe = sum(hwe_1yes))  %>% 
-      filter(sum_in_hwe <= nPop(obj_noFams)/2) %>% # just grab the loci that fail in over half the years
-      left_join(locus_info, by = 'locus') %>% 
+      filter(sum_in_hwe <= nPop(obj)/2) %>% # just grab the loci that fail in over half the years
+      #left_join(locus_info, by = 'locus') %>% 
       write_csv('/workdir/smallmouth/gtseq/results/loci_failing_hwe_over_50_percent_years.csv')
-    
-          read_csv('/workdir/smallmouth/gtseq/results/loci_failing_hwe_over_50_percent_years.csv')
-
     
     hwe_plot %>% 
       ggplot(aes(pop, locus, fill = hwe_1yes)) +
@@ -732,8 +722,8 @@ linkage_threshold<-0.8
         site_distances<-read_csv('/workdir/smallmouth/ecological/BEFsites_LengthAndHabitat_BMQ_070318_1_shoreline_distances.csv') %>% 
           filter(Water=='LML')
 
-# Figure 1a
-      figure_1a<-allFish %>%
+# cpue
+      fig_cpue<-allFish %>%
         mutate(jDate = lubridate::yday(DATE_COL),
              ysamp = str_sub(YSAMP_N, -2)) %>% 
         filter(between(year, 1998, 2020), !is.na(effortSec), (GEAR_CODE == 'NAF' | GEAR_CODE == 'NBO'), WATER == 'LML', month<7) %>% 
@@ -756,15 +746,13 @@ linkage_threshold<-0.8
         geom_smooth(span=0.15) +
         ylab('Catch / minute') + 
         scale_color_viridis_d('Length bin\n(mm)') +
-        geom_vline(xintercept = 2000.5, lty = 'dotted') +
+        geom_vline(xintercept = 2000.5, lty = 'dashed') +
         xlim(1998,2020) +
         coord_cartesian(ylim=c(0, 4)) +
-        theme_cowplot() +
-        theme(axis.text.x=element_blank(),axis.title.x=element_blank()) +
-        ggtitle("A")
+        theme_cowplot()
 
-# Figure 1b
-      figure_1b<-
+# length histos
+      fig_length<-
         allFish %>%
         filter(between(year, 1998, 2020), (GEAR_CODE == 'NAF' | GEAR_CODE == 'NBO'), !is.na(LENGTH), WATER == 'LML', SEASON=='S') %>% 
         ggplot(aes(x=LENGTH, y=as.factor(year), fill=stat(x))) + 
@@ -774,31 +762,36 @@ linkage_threshold<-0.8
         labs(y='Year',x='Length (mm)') + 
         theme_cowplot() +
         coord_flip() +
-        theme(legend.position="none", axis.text.x=element_blank(),axis.title.x=element_blank()) + 
-        scale_y_discrete(breaks = c(2000, 2005, 2010, 2015, 2020)) + # axis.text.x = element_text(angle = 45, vjust = 1, hjust=1), 
-        ggtitle("B")
+        scale_y_discrete(breaks = c(2000, 2005, 2010, 2015, 2020))
 
-# Figure 1c
-      figure_1c<-allFish %>% 
+# female gsi age-4
+      fig_female_gsi_data<-allFish %>% 
         filter(!is.na(newGSI), sex == 'F', (WATER == 'LML' | WATER == 'WLL'), ageTrue == 4, year < 2021) %>% 
-        mutate(Lake = if_else(WATER == 'LML', 'Little Moose', 'Woodhull'),
-          yearlake = paste0(year, Lake)) %>% 
+        mutate(Lake = if_else(WATER == 'LML', 'Suppression', 'Reference'),
+               Lake = factor(Lake, levels = c('Suppression','Reference')),
+               yearlake = paste0(year, Lake))
+      
+      fig_female_gsi<-fig_female_gsi_data %>% 
         ggplot(aes(year, newGSI, color = Lake)) + 
         geom_boxplot(aes(group = yearlake, color = Lake)) +
         geom_jitter(height=0, width=0.1, alpha = 0.5) +
         stat_smooth(method = 'lm') + 
         labs(x='Year', y='Age 4\nfemale GSI') + 
         theme_cowplot() + xlim(1998, 2020) + 
-        geom_vline(xintercept = 2000.5, lty='dotted') + 
-        theme(legend.position="none", axis.text.x=element_blank(),axis.title.x=element_blank()) + 
-        scale_color_manual(values=c("black", "blue")) +
-        ggtitle("C")
+        geom_vline(xintercept = 2000.5, lty='dashed') + 
+        scale_color_manual(values=c("black", "blue"))
+      
+      summary(lm(newGSI ~ year, 
+                 data = filter(fig_female_gsi_data, Lake == 'Suppression')))
 
-# Figure 1d 
-      figure_1d<-allFish %>% 
+# male gsi age-3
+      fig_male_gsi_data<-allFish %>% 
         filter(!is.na(newGSI), sex == 'M', (WATER == 'LML' | WATER == 'WLL'), ageTrue == 3, year < 2021) %>% 
-        mutate(Lake = if_else(WATER == 'LML', 'Little Moose', 'Woodhull'),
-               yearlake = paste0(year, Lake)) %>% 
+        mutate(Lake = if_else(WATER == 'LML', 'Suppression', 'Reference'),
+               Lake = factor(Lake, levels = c('Suppression','Reference')),
+               yearlake = paste0(year, Lake)) 
+      
+      fig_male_gsi<-fig_male_gsi_data %>% 
         ggplot(aes(year, newGSI, color = Lake)) + 
         geom_boxplot(aes(group = yearlake, color = Lake)) +
         geom_jitter(height=0, width=0.1, alpha = 0.5) +
@@ -806,13 +799,14 @@ linkage_threshold<-0.8
         labs(x='Year', y='Age 3\nmale GSI') + 
         theme_cowplot() +  
         xlim(1998, 2020) + 
-        geom_vline(xintercept = 2000.5, lty='dotted') + 
-        theme(axis.text.x=element_blank(),axis.title.x=element_blank()) + 
-        scale_color_manual(values=c("black", "blue")) +
-        ggtitle("D")
+        geom_vline(xintercept = 2000.5, lty='dashed') + 
+        scale_color_manual(values=c("black", "blue"))
+      
+      summary(lm(newGSI ~ year,
+                 data = filter(fig_male_gsi_data, Lake == 'Suppression')))
 
-#### Figure 1e
-      figure_1e<-allFish %>% 
+#### length at age
+      fig_length_age<-allFish %>% 
         filter(SEASON == 'S', GEAR=='BEF', !is.na(ageLengthed), between(year, 1998, 2017), ageLengthed<5) %>% 
         mutate(ageyear = paste0(ageLengthed, year)) %>% 
         ggplot(aes(year, LENGTH)) + 
@@ -820,47 +814,11 @@ linkage_threshold<-0.8
         geom_smooth(aes(group = ageLengthed, color = ageLengthed), span = .3, level = 0.95) +
         labs(x='Year', y = 'Length (mm)', color = 'Age') +
         theme_cowplot() +
-        geom_vline(xintercept = 2000.5, lty = 'dotted') +
+        geom_vline(xintercept = 2000.5, lty = 'dashed') +
         #theme(legend.position="none") +
-        xlim(1998, 2020) +
-        ggtitle("E")
-      
-    plot_grid(figure_1a, figure_1b, figure_1c, figure_1d, figure_1e, ncol=1, align="v")
-    ggsave('/workdir/smallmouth/chapter_3_exports/Fig_1a-1e.png', height=10, width = 6)
+        xlim(1998, 2020)
 
 ```
-
-Calculate difference in pre- vs during-suppression size-at-age. mean and p-val
-```{r}
-# Generate dataset
-    size_at_age_data<-filter(allFish, WATER == 'LML', between(ageLengthed, 0, 6), between(year, 1998, 2017), GEAR=='BEF') %>% 
-      mutate(pre_post = if_else(year<2001, 'Pre','Post'),
-             pre_post_age = paste0(ageLengthed, pre_post)) %>% 
-      filter(!is.na(pre_post))
-      
-# Plot length
-      ggplot(size_at_age_data, aes(ageLengthed, LENGTH, color = pre_post)) + 
-        geom_boxplot(aes(group = pre_post_age)) + 
-        geom_smooth(span=2, se = F) + 
-        theme_cowplot() + 
-        labs(x = 'Age', y = 'Length (mm)', color = 'Post- vs. pre-\nremoval effort') + 
-        facet_wrap(~SEASON) 
-      ggsave('/workdir/smallmouth/ecological/results/length_at_age_spring_fall.png', height=4, width=6)
-      
-# Statistical comparison
-      pval_out<-tibble()
-      for(age_in in 0:4){
-        for(season in c('S','F')){
-          try({
-        pv_lei<-summary(lm(LENGTH ~ pre_post, data = filter(size_at_age_data, ageLengthed==age_in, SEASON == season)))
-        pval_out<-bind_rows(pval_out, tibble(ageLengthed=age_in, pval_length=pv_lei$coefficients[2,4], effect_length=pv_lei$coefficients[2,1],SEASON = season))
-          })
-        }
-      }
-    pval_out
-```
-
-#### Figure 1f-g
 
 fishR vignette on reverse modeling of annual age-specific mortality
 ```{r}
@@ -922,36 +880,130 @@ for(yr in unique(catch_curves_out$year)){
 }
 
 # Figure 1f
-fig_1f<-mutate(catch_curves_out, Suppression = if_else(year < 2001, 'Before', 'During'),
-       suppression_age = paste0(Suppression, age_catch_curve)) %>% 
+fig_catch_age<-mutate(catch_curves_out, Years = if_else(year < 2001, '1998-2000', '2001-2020'),
+       suppression_age = paste0(Years, age_catch_curve)) %>% 
   filter(age_catch_curve < 7) %>% 
-  ggplot(aes(age_catch_curve, n, color = Suppression)) + 
+  ggplot(aes(age_catch_curve, n, color = Years)) + 
   geom_boxplot(aes(group = suppression_age), outlier.color = NA) +
   geom_jitter(alpha=0.2, position=position_jitterdodge(jitter.width = 0.1, jitter.height = 0)) + 
   geom_smooth(span=1, se = F) + 
   theme_cowplot() + 
-  labs(x = 'Age', y = 'Catch') +
-  ggtitle("F")
+  labs(x = 'Age', y = 'Catch')
 
 # Figure 1g
-fig_1g<-summ_out %>% 
-  filter(mortality == 'S') %>% 
-  mutate(Suppression = if_else(year < 2001, 'Before', 'During'), Estimate = Estimate/100) %>% 
-  ggplot(aes(Suppression, Estimate, group = Suppression, color = Suppression)) + 
+fig_survival_data<-summ_out %>% 
+  filter(mortality == 'S',
+         year < 2021) %>% 
+  mutate(Years = if_else(year < 2001, '1998-2000', '2001-2020'), 
+         Estimate = Estimate/100) 
+
+fig_survival<-fig_survival_data %>% 
+  ggplot(aes(Years, Estimate, group = Years, color = Years)) + 
   geom_boxplot() + 
   geom_jitter(height = 0, width = 0.1) + 
   labs(y = 'Annual survival estimate') + 
-  theme_cowplot() +
-  theme(legend.position = 'none')  +
-  ggtitle("G")
+  theme_cowplot()
 
-  plot_grid(fig_1f,fig_1g, ncol=1, align="v")
-  ggsave('/workdir/smallmouth/chapter_3_exports/Fig_1f-1g.png', height=5, width = 5)
+calc_diff<-fig_survival_data %>% 
+  group_by(Years) %>% 
+  summarise(survival = mean(Estimate)) %>% 
+  mutate(mortality = 1-survival)
+
+paste0('Survival was reduced by ', round(1-calc_diff$survival[2]/calc_diff$survival[1], 2)*100, '%')
+
+calc_diff$mortality[2] / calc_diff$mortality[1]
 ```
 
-# Figure 2
 
-manhattan plot
+Plot fig 1
+```{r}
+height_out<-10
+width_out<-7
+
+plot_grid(
+    plot_grid(fig_cpue +
+                theme(axis.text.x=element_blank(),
+                      axis.title.x = element_blank()) +
+                ggtitle('a')
+              , fig_length +
+                theme(legend.position='none') +
+                theme(axis.text.x=element_blank(),
+                      axis.title.x = element_blank()) +
+                ggtitle('b')
+              , fig_female_gsi +
+                theme(axis.text.x=element_blank(),
+                      axis.title.x = element_blank()) +
+                ggtitle('c')
+              , fig_male_gsi +
+                theme(legend.position='none') +
+                ggtitle('d')
+              , ncol=1
+              , align="v"
+              )
+    , plot_grid(fig_length_age +
+                  ggtitle('e')
+              , fig_catch_age +
+                ggtitle('f')
+              , fig_survival +
+                theme(legend.position='none') +
+                ggtitle('g')
+              , ncol = 1
+              , align = 'v'
+    )
+)
+        ggsave('/workdir/smallmouth/chapter_3_exports/Fig_1.png', height=10, width = 10)
+
+```
+
+Calculate difference in pre- vs during-suppression size-at-age. mean and p-val
+```{r}
+# Generate dataset
+    size_at_age_data<-filter(allFish, WATER == 'LML', between(ageLengthed, 0, 6), between(year, 1998, 2017), GEAR=='BEF') %>% 
+      mutate(pre_post = if_else(year<2001, 'Pre','Post'),
+             pre_post_age = paste0(ageLengthed, pre_post)) %>% 
+      filter(!is.na(pre_post))
+      
+# Plot length
+      ggplot(size_at_age_data, aes(ageLengthed, LENGTH, color = pre_post)) + 
+        geom_boxplot(aes(group = pre_post_age)) + 
+        geom_smooth(span=2, se = F) + 
+        theme_cowplot() + 
+        labs(x = 'Age', y = 'Length (mm)', color = 'Post- vs. pre-\nremoval effort') + 
+        facet_wrap(~SEASON) 
+      ggsave('/workdir/smallmouth/ecological/results/length_at_age_spring_fall.png', height=4, width=6)
+      
+# Statistical comparison
+      pval_out<-tibble()
+      for(age_in in 0:4){
+        for(season in c('S','F')){
+          try({
+        pv_lei<-summary(lm(LENGTH ~ pre_post, data = filter(size_at_age_data, ageLengthed==age_in, SEASON == season)))
+        pval_out<-bind_rows(pval_out, 
+                            tibble(ageLengthed=age_in, 
+                                   pval_length=pv_lei$coefficients[2,4], 
+                                   effect_length=pv_lei$coefficients[2,1],
+                                   SEASON = season))
+          })
+        }
+      }
+      
+      pval_out
+     
+# Random effect
+    rand<-lme(LENGTH ~ pre_post,
+                random = ~1|ageLengthed,
+                data = filter(size_at_age_data, 
+                              SEASON == 'S', 
+                              between(ageLengthed, 1, 4)))
+    summary(rand)
+    r.squaredGLMM(rand)
+    
+```
+
+# Figures 2 and 3
+## Prep for figures 2 and 3
+
+### manhattan plot
 ```{r eval=T}
 lg_filter <- read_csv('/workdir/smallmouth/sample_lists/lg_reference_annotate.csv')
 lg_filter_temp <- rename(lg_filter, LG = lg, lg = chr)
@@ -988,7 +1040,7 @@ minind <- 20
       threshold_window <- quantile(fst_window$fst_mean, 0.99, na.rm = T)
       
   # Alternatively, use Zfst
-      fst_window %>% 
+      lcwgs_fst<-fst_window %>% 
         ungroup() %>%
          mutate( Zfst = (fst_mean - mean(fst_mean))/sd(fst_mean),
                signifi = if_else(Zfst > 5, 0, 1)) %>%
@@ -1004,78 +1056,36 @@ minind <- 20
             legend.position='none',
             axis.text.x=element_blank(),
             axis.ticks.x=element_blank())
-        ggsave('/workdir/smallmouth/chapter_3_exports/figure_2a.png', width = 20, height = 6, units = 'cm')
-# 
-#   # Plot the window Fst with 99% CI
-#         fst_window %>%
-#         mutate(signifi = if_else(fst_mean > threshold_window, 0, 1)) %>%
-#         ggplot(aes(x=pos/10^6, y=fst_mean)) +
-#         geom_point(aes(color = signifi), size=0.5, alpha=0.5) +
-#         geom_smooth(color='blue', se=F) +
-#         scale_x_continuous(breaks=seq(0, 50, 5)) +
-#         xlab('position (Mbp)') +
-#         ylab(paste('Fst ',window_length/1000,'kb window')) +
-#         facet_grid(.~name, scales='free_x', space='free_x') +
-#         theme_cowplot() +
-#         ggtitle('Little Moose 2000 vs 2019') +
-#         geom_hline(yintercept = threshold_window, lty = 'dotted') +
-#         xlab('') + ylab('50kbp window Fst') +
-#         theme(panel.spacing = unit(0.1, 'lines'),
-#             axis.title.x=element_text(),
-#             legend.position='none',
-#             axis.text.x=element_blank(),
-#             axis.ticks.x=element_blank(),
-#             #strip.text = element_blank()
-#             ) +
-#           ggtitle("A")
-#         ggsave('/workdir/smallmouth/chapter_3_exports/figure_3a.png', width = 23, height = 7, units = 'cm', pointsize = 20)
-#         
-#         
-#   # Plot non-window Fst with 99% CI
-#     threshold_fst <- quantile(fst$fst, 0.99, na.rm = T)
-#     
-#     fst %>%
-#       filter(name == 6 | name == 7 | name == 19) %>% 
-#       mutate(signifi = if_else(fst > threshold_fst, 0, 1)) %>%
-#       ggplot(aes(x=pos/10^6, y=fst)) +
-#       geom_point(aes(color = signifi), size=0.5, alpha=0.5) +
-#       geom_smooth(color='blue', se=F) +
-#       scale_x_continuous(breaks=seq(0, 50, 5)) +
-#       xlab('position (Mbp)') +
-#       ylab(paste('Fst ',window_length/1000,'kb window')) +
-#       facet_grid(.~name, scales='free_x', space='free_x') +
-#       theme_cowplot() +
-#       ggtitle('Little Moose 2000 vs 2019') +
-#       geom_hline(yintercept = threshold_fst, lty = 'dotted') +
-#       xlab('') + ylab('Fst') +
-#       theme(panel.spacing = unit(0.1, 'lines'),
-#           axis.title.x=element_text(),
-#           plot.title = element_text(size = 10),
-#           legend.position='none',
-#           text = element_text(size=12),
-#           axis.text = element_text(size=12),
-#           axis.text.x=element_blank(),
-#           axis.ticks.x=element_blank())
-#     
-#     ggsave(filename  = paste0('/workdir/smallmouth/figures/fst_minind', minind, '_A_D_no_window.png'), width = 30, height = 8, units = 'cm', pointsize = 20)
 ```
+
+### adaptive AF 
 
 Generate AF dataset
 ```{r}
+# add lg7 to loci_selected
+loci_selected<-c('adaptive_lg19_12740897-pos201', 'adaptive_lg6_3256886-pos201','adaptive_lg7_25601423-pos157')
+
 # pull in the maf from lcwgs data
 A_maf<-as_tibble(read.table(gzfile(paste0('/workdir/smallmouth/angsd/popminind20/A_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.mafs.gz')), header = TRUE))
 
 D_maf<-as_tibble(read.table(gzfile(paste0('/workdir/smallmouth/angsd/popminind20/D_global_snp_list_bam_list_realigned_smb_anchored_mincov_filtered_mindp39_maxdp350_minind21_minq20_popminind20.mafs.gz')), header = TRUE))
 
+# lcwgs chr 6
 # filter(ordered_amplicons, microhap_name == 'adaptive_lg6_3256886') # position 201, plus the fasta_start
 # filter(A_maf, chromo == 'NW_024040485.1_RagTag', position == 201+3256686-1) # starts at 0.16
 # filter(D_maf, chromo == 'NW_024040485.1_RagTag', position == 201+3256686-1) # ends at 0.77
 # 
+# lcwgs chr 19
 # filter(ordered_amplicons, microhap_name == 'adaptive_lg19_12740897') # 201+12740697-1
-# filter(A_maf, chromo == 'NW_024044237.1_RagTag', position == 201+12740697-1) # starts at 0.17
+# filter(A_maf, chromo == 'NW_024044237.1_RagTag', between(position, 12740697-100, 12740697+100)) # starts at 0.17
 # filter(D_maf, chromo == 'NW_024044237.1_RagTag', position == 201+12740697-1) # ends at 0.91
+# 
+# # lcwgs chr 7
+# filter(ordered_amplicons, microhap_name == 'adaptive_lg7_25601423') 
+# filter(A_maf, chromo == 'NW_024040596.1_RagTag', position==25601423)
+# filter(D_maf, chromo == 'NW_024040596.1_RagTag', position == 25601423)
 
-lcwgs_af<-tibble(locus = c('adaptive_lg6_3256886-pos201','adaptive_lg19_12740897-pos201'), '2000' = c(0.16, 0.17), '2019' = c(0.77, 0.91)) %>% 
+lcwgs_af<-tibble(locus = c('adaptive_lg6_3256886-pos201','adaptive_lg19_12740897-pos201','adaptive_lg7_25601423-pos157'), '2000' = c(0.16, 0.17, 0.28), '2019' = c(0.77, 0.91, 0.76)) %>% 
   pivot_longer(-locus, names_to = 'year', values_to = 'meanAF') %>% 
   mutate(type='Whole-genome', year = as.double(year))
 
@@ -1083,7 +1093,8 @@ lcwgs_af<-tibble(locus = c('adaptive_lg6_3256886-pos201','adaptive_lg19_12740897
     LML_inds<-filter(phenos, WATER=='LML') %>% 
       dplyr::select(GENID_duplicate, year)
     
-    pre_post_AF<-microhap_snp %>% 
+    pre_post_AF<-
+      microhap_snp %>% 
       left_join(LML_inds, by = 'GENID_duplicate') %>% 
       filter(!is.na(year)) %>%
       dplyr::select(GENID_duplicate, locus, year, AlleIdx_1, AlleIdx_2) %>% 
@@ -1098,7 +1109,7 @@ lcwgs_af<-tibble(locus = c('adaptive_lg6_3256886-pos201','adaptive_lg19_12740897
       ungroup() %>% 
       filter(str_detect(locus, 'adaptive')) %>%
       mutate(type='Amplicon')
-
+      
     # Plot them as a big wrap
       ggplot(pre_post_AF, aes(year, meanAF)) + geom_point() + geom_line() + ylim(0,1) + geom_vline(xintercept = 2000, lty='dotted') + facet_wrap(~locus)
       ggsave(paste0('/workdir/smallmouth/gtseq/results/AF_out_adaptive.png'), height=15, width=15) # 5, 10
@@ -1120,49 +1131,133 @@ lcwgs_af<-tibble(locus = c('adaptive_lg6_3256886-pos201','adaptive_lg19_12740897
       labs(x='Year', y='Allele frequency')
     ggsave('/workdir/smallmouth/gtseq/results/AF_change_lg19_loci.png', height=8, width = 3)
 ```
-  
-assess linkage disequilibrium (r2)
+
+loci showing strong AF change, look for significance
 ```{r}
-# calculate r2 between loci within chromosome
-for(lg_in in c('lg6','lg7','lg19')){
-  
-  if(lg_in == "lg19"){
-    plot_size<-7
-  } else{
-    plot_size<-4
-  } 
-   
-  corplot_in<-microhap_snp %>% 
-    filter(GENID_duplicate %in% filter(phenos, WATER=='LML')$GENID_duplicate,
-           str_detect(locus, 'adaptive'),
-           str_detect(locus, lg_in)) %>% 
-    mutate(locus = str_replace(locus, 'gwas_', '')) %>% 
-    separate(locus, into = c('xx','lg','pos'), sep = '_') %>% 
-    separate(pos, into = c('pos','pos2'), sep = '-pos') %>% 
-    mutate(pos = paste0(as.integer(pos)+as.integer(pos2), '-')) %>% 
-    dplyr::select(GENID_duplicate, pos, AlleIdx_genoty) %>% 
-    arrange(pos) %>% 
-    pivot_wider(names_from = pos, values_from = AlleIdx_genoty) 
+
+tib_out_sig<-tibble()
+prop_mature_plot<-list() # load the proportion mature into this list
+prop_genos_plot<-list() # load the genotype change through time into this list
+for(loc_in in loci_selected[1:2]){ # exclude lg 7 for now
+
+  # Build the phenotype dataset
+    phenos_dataset<-filter(microhap_snp, locus == loc_in) %>% 
+      left_join(obj_fams, by = 'GENID_duplicate') %>% 
+      filter(WATER == 'LML', SEASON == 'S', !is.na(ageLengthed), ageLengthed < 5) %>% 
+      mutate(AlleIdx_genoty = as.factor(AlleIdx_genoty))
     
-    cor_in<-cor(dplyr::select(corplot_in, -GENID_duplicate), use='pairwise.complete.obs')
-    
-    corplot<-ggcorrplot::ggcorrplot(cor_in, 
-                           lab = TRUE,
-                           show.legend = F,
-                           lab_size = 3,
-                           title = str_replace(lg_in, 'lg', 'Chromosome '))
-    
-    ggsave(paste0('/workdir/smallmouth/gtseq/results/correlation_snps_',lg_in,'.png'), corplot, width = plot_size, height = plot_size)
+  # Make a function to remove individuals in the same family
+    no_dups<-function(input, seed_in){
+      set.seed(seed_in)
+      
+      input %>% 
+        group_by(fam_index) %>% 
+        slice_sample(n=1) %>% 
+        ungroup()
+    }
+
+  # run analyses over loci
+    tib_out_sex<-tibble()
+    tib_out<-tibble()
+    for(age_in in 1:4){
+      for(sex_in in c('F','M')){
+        for(i in 1:5){
+        # Test if any are different using an anova
+          # GSI for each sex independently
+            data_in<-filter(phenos_dataset, ageLengthed == age_in, sex == sex_in, !is.na(newGSI), newGSI>0) %>% 
+              no_dups(i)
+
+            kt_gsi_sex<-lm(log(newGSI) ~ AlleIdx_genoty, # gsi for each sex
+                             data = data_in)
+
+          # length for each sex independently
+            data_in<-filter(phenos_dataset,ageLengthed == age_in, sex == sex_in) %>% 
+              no_dups(i)
+            kt_length_sex<-lm(yearly_length_anomaly ~ AlleIdx_genoty, # yearly length anomaly for each sex
+                             data = data_in)
+      
+          # length for both sexes combined   
+            data_in<-filter(phenos_dataset, ageLengthed == age_in) %>% 
+              no_dups(i)
+            kt_length<-lm(yearly_length_anomaly ~ AlleIdx_genoty, # yearly length anomaly, combining sexes
+                             data = data_in)
+
+            
+          # eggDate
+            data_in<-left_join(microhap_snp, obj_fams, by = 'GENID_duplicate') %>% 
+              filter(locus == loc_in, WATER == 'LML', str_detect(SAMPLE, 'NEST'), !is.na(eggDate), !is.na(genoty), !is.na(year)) %>% 
+              group_by(WAYPOINT) %>% 
+              slice_head(n=1) %>% 
+              no_dups(i)
+            kt_egg<-nlme::lme(eggDate~as.factor(genoty), 
+                                    random=~1|year,
+                                    data = data_in)
+            
+          # export regression info
+            if(age_in == 3 & sex_in == 'M' & i == 2 & str_detect(loc_in, 'lg6')){
+              print('lg 6 age 3 male')
+              print(summary(kt_gsi_sex))
+              print(length(kt_gsi_sex$residuals))
+              print(summary(kt_length_sex))
+              print(length(kt_length_sex$residuals))
+              length(kt_gsi_sex$residuals)
+            }
+            
+           if(age_in == 3 & sex_in == 'F' & i == 1 & str_detect(loc_in, 'lg19')){
+              print('lg 19 age 3 female')
+              print(summary(kt_gsi_sex))
+              print(length(kt_gsi_sex$residuals))
+           }
+            
+           if(age_in == 3 & i == 1 & str_detect(loc_in, 'lg19')){
+              print('lg 19 age 3 both sexes')
+              print(summary(kt_length))
+              print(length(kt_length$residuals))
+           }
+            
+           if(age_in == 1 & i == 1 & str_detect(loc_in, 'lg19')){
+              print('lg 19 age 1 both sexes')
+              print(summary(kt_length))
+              print(length(kt_length$residuals))
+            }
+
+          # consolidate the ANOVA p-values
+            tib_out_sex<-bind_rows(tib_out_sex, 
+                                    tibble(ageL = age_in, 
+                                    sex = sex_in, 
+                                    i=i,
+                                    gsi_anova_bysex = anova(kt_gsi_sex)$`Pr(>F)`[1], 
+                                    len_anova_bysex = anova(kt_length_sex)$`Pr(>F)`[1],
+                                    len_anova_bothsex = anova(kt_length)$`Pr(>F)`[1],
+                                    eggdate_anova_randomyear = anova(kt_egg)$`p-value`[2]))
+            
+        }
+      }
+    }
+    tib_out_sig_in<-tib_out_sex %>% 
+      pivot_longer(-c(ageL, sex, i)) %>% 
+      filter(value<0.05) %>% 
+      group_by(ageL, sex, name) %>% 
+      pivot_wider(names_from = i, values_from = value) %>% 
+      mutate(locus = loc_in)
+
+    tib_out_sig<-bind_rows(tib_out_sig, tib_out_sig_in)
 }
+
+tib_out_sig
+
 ```
-  
+
 per locus: AF, Ho change, genotype frequency change, anovas for genotype-phenotype interactions , plots
 ```{r}
 tib_out_sig<-tibble()
 prop_mature_plot<-list() # load the proportion mature into this list
 prop_genos_plot<-list() # load the genotype change through time into this list
+af_out<-list()
+len_out<-list()
+gsi_out<-list()
 for(loc_in in loci_selected){
-  
+
   # Build the phenotype dataset
     phenos_dataset<-filter(microhap_snp, locus == loc_in) %>% 
       left_join(obj_fams, by = 'GENID_duplicate') %>% 
@@ -1175,7 +1270,8 @@ for(loc_in in loci_selected){
       
       input %>% 
         group_by(fam_index) %>% 
-        slice_sample(n=1)
+        slice_sample(n=1) %>% 
+        ungroup()
     }
     
   # run analyses over loci
@@ -1188,9 +1284,10 @@ for(loc_in in loci_selected){
           # GSI for each sex independently
             data_in<-filter(phenos_dataset, ageLengthed == age_in, sex == sex_in, !is.na(newGSI), newGSI>0) %>% 
               no_dups(i)
-            kt_gsi_sex<-lm(log(newGSI) ~ idx_genoty, # gsi for each sex
-                             data = data_in)
-            
+
+            try(kt_gsi_sex<-lm(log(newGSI) ~ idx_genoty, # gsi for each sex
+                             data = data_in))
+
             # Export effect size and r2  
               if(str_detect(loc_in, 'lg19') & age_in == 3 & sex_in == 'F' & i == 1){
                 print('lg19, age3, female, gsi')
@@ -1207,8 +1304,8 @@ for(loc_in in loci_selected){
           # length for each sex independently
             data_in<-filter(phenos_dataset,ageLengthed == age_in, sex == sex_in) %>% 
               no_dups(i)
-            kt_length_sex<-lm(yearly_length_anomaly ~ idx_genoty, # yearly length anomaly for each sex
-                             data = data_in)
+            kt_length_sex<-try(lm(yearly_length_anomaly ~ idx_genoty, # yearly length anomaly for each sex
+                             data = data_in))
             
             # export the effect size and r2
               if(str_detect(loc_in, 'lg6') & age_in == 3 & sex_in == 'M' & i == 1){
@@ -1220,8 +1317,8 @@ for(loc_in in loci_selected){
           # length for both sexes combined   
             data_in<-filter(phenos_dataset, ageLengthed == age_in) %>% 
               no_dups(i)
-            kt_length<-lm(yearly_length_anomaly ~ idx_genoty, # yearly length anomaly, combining sexes
-                             data = data_in)
+            kt_length<-try(lm(yearly_length_anomaly ~ idx_genoty, # yearly length anomaly, combining sexes
+                             data = data_in))
             
             # export the effect size and r2
               if(str_detect(loc_in, 'lg19') & age_in == 1 & sex_in == 'F' & i == 1){
@@ -1247,18 +1344,20 @@ for(loc_in in loci_selected){
                                     data = data_in)
 
           # consolidate the ANOVA p-values
-            tib_out_sex<-bind_rows(tib_out_sex, 
+            try(tib_out_sex<-bind_rows(tib_out_sex, 
                                     tibble(ageL = age_in, 
                                     sex = sex_in, 
                                     i=i,
                                     gsi_anova_bysex = anova(kt_gsi_sex)$`Pr(>F)`[1], 
                                     len_anova_bysex = anova(kt_length_sex)$`Pr(>F)`[1],
                                     len_anova_bothsex = anova(kt_length)$`Pr(>F)`[1],
-                                    eggdate_anova_randomyear = anova(kt_egg)$`p-value`[2]))
+                                    eggdate_anova_randomyear = anova(kt_egg)$`p-value`[2])))
+            
         }
       }
     }
-    tib_out_sig_in<-tib_out_sex %>% 
+    
+    try({ib_out_sig_in<-tib_out_sex %>% 
       pivot_longer(-c(ageL, sex, i)) %>% 
       filter(value<0.05) %>% 
       group_by(ageL, sex, name) %>% 
@@ -1266,7 +1365,7 @@ for(loc_in in loci_selected){
       mutate(locus = loc_in)
 
     tib_out_sig<-bind_rows(tib_out_sig, tib_out_sig_in)
-    
+    })
     # add full sex names
       phenos_dataset_sex<-phenos_dataset %>% 
         mutate(sex_in = if_else(sex == 'M', 'Male',
@@ -1278,16 +1377,16 @@ for(loc_in in loci_selected){
         phenos_dataset_filtered<-filter(phenos_dataset, sex == 'M')
         length_label<-'Male Length\n(mm)'
         plot_name<-'Chromosome 6'
-        panel_names<-c('B','C','D')
+        panel_names<-c('b','c','d')
       } else {
         phenos_dataset_filtered<-phenos_dataset
         length_label<-'Length\n(mm)'
         plot_name<-'Chromosome 19'
-        panel_names<-c('E','F','G')
+        panel_names<-c('e','f','g')
       }
     
     # length
-      len_out<-phenos_dataset_filtered %>% 
+      len_out[[loc_in]]<-phenos_dataset_filtered %>% 
         ggplot(aes(as.character(ageLengthed), LENGTH, color = genoty)) + 
         geom_boxplot(outlier.color = NA) + 
         labs(x='Age', y = length_label, color = 'Genotype') + 
@@ -1295,39 +1394,45 @@ for(loc_in in loci_selected){
         geom_point(position=position_jitterdodge(jitter.width = 0.2, jitter.height = 0), 
                    aes(group = genoty), alpha=0.2) +
         theme_cowplot() +
-        theme(legend.position = 'none')  +
-        ggtitle(panel_names[2])
+        theme(legend.position = 'none')
 
     # gsi
-      gsi_out<-phenos_dataset_sex %>% 
-        filter(between(ageLengthed, 2, 4)) %>% 
+      gsi_out[[paste0(loc_in, '_M')]]<-phenos_dataset_sex %>% 
+        filter(between(ageLengthed, 1, 4), sex_in == 'Male') %>% 
         ggplot(aes(as.character(ageLengthed), newGSI, color = genoty)) + 
         geom_boxplot(outlier.color = NA) + 
         labs(x='Age', y = 'Gonadal-Somatic\nIndex', color = 'Genotype') + 
         scale_color_viridis_d(option = 'D') + 
         geom_point(position=position_jitterdodge(jitter.width = 0.2, jitter.height = 0), 
                    aes(group = genoty), alpha=0.2) +
-        facet_wrap(~sex_in, scales = 'free') +
         theme_cowplot() +
-        theme(legend.position = 'none')  +
-        ggtitle(panel_names[3])
+        theme(legend.position = 'none')
+      
+      gsi_out[[paste0(loc_in, '_F')]]<-phenos_dataset_sex %>% 
+        filter(between(ageLengthed, 1, 4), sex_in == 'Female') %>% 
+        ggplot(aes(as.character(ageLengthed), newGSI, color = genoty)) + 
+        geom_boxplot(outlier.color = NA) + 
+        labs(x='Age', y = 'Gonadal-Somatic\nIndex', color = 'Genotype') + 
+        scale_color_viridis_d(option = 'D') + 
+        geom_point(position=position_jitterdodge(jitter.width = 0.2, jitter.height = 0), 
+                   aes(group = genoty), alpha=0.2) +
+        theme_cowplot() +
+        theme(legend.position = 'none')
       
       
     # Plot AF through time
       dat_in<-filter(pre_post_AF, locus == loc_in) %>%
         bind_rows(filter(lcwgs_af, locus == loc_in))
       
-      af_out<-ggplot(NULL) + 
+      af_out[[loc_in]]<-ggplot(NULL) + 
         geom_point(data=dat_in, aes(year, meanAF, color = type)) + 
         geom_line(data=filter(dat_in, year>1995 & type=='Amplicon'), aes(year, meanAF), color = 'red') + 
         geom_line(data=filter(dat_in, year<2000), aes(year, meanAF), color = 'red', lty='dashed') + 
         ylim(0,1) + 
-        geom_vline(xintercept = 2000.5, lty='dotted') +
+        geom_vline(xintercept = 2000.5, lty='dashed') +
         labs(y= 'Allele\nfrequency', x = 'Year') + 
         theme_cowplot() + 
-        #theme(legend.position="none") +
-        xlim(1970, 2020) +
-        ggtitle(panel_names[1])
+        xlim(1970, 2020)
 
     # proportion mature
       propm<-phenos_dataset_sex %>% 
@@ -1365,19 +1470,9 @@ for(loc_in in loci_selected){
         labs(x = 'Year', y = 'Genotype proportion', color = 'Genotype') +
         theme_cowplot()
       prop_genos_plot[[loc_in]]<-propg
-
-      # Bind AF, length, GSI for figure 3 export
-      plot_grid(af_out, len_out, gsi_out, ncol=1, align="v")
-      ggsave(paste0('/workdir/smallmouth/chapter_3_exports/fig3_',loc_in,'.png'), height = 7, width = 4)
 }
 
 tib_out_sig
-
-plot_grid(plotlist = prop_mature_plot, ncol = 1)
-ggsave('/workdir/smallmouth/gtseq/results/prop_mature_adaptive_loci.png', height=6, width=6)
-      
-plot_grid(plotlist = prop_genos_plot, ncol = 1)
-ggsave('/workdir/smallmouth/gtseq/results/genotype_frequency_changes_adaptive_loci.png', height=6, width=5)
 
 # what is the total % of age-3 GSI variation we can explain with both loci?
   data_in<-filter(microhap_snp, locus %in% loci_selected) %>% 
@@ -1387,12 +1482,44 @@ ggsave('/workdir/smallmouth/gtseq/results/genotype_frequency_changes_adaptive_lo
     dplyr::select(GENID_duplicate, locus, genoty, newGSI, sex) %>% 
     mutate(locus = if_else(str_detect(locus, 'lg19'), 'lg19','lg6')) %>% 
     pivot_wider(names_from = locus, values_from = genoty)
-  summary(lm(log(newGSI) ~ lg19 + lg6 + sex, data = data_in))
 ```
-
-# Figure 3
-
-## Relatedness
+  
+assess linkage disequilibrium (r2)
+```{r}
+# calculate r2 between loci within chromosome
+for(lg_in in c('lg6','lg7','lg19')){
+  
+  if(lg_in == "lg19"){
+    plot_size<-7
+  } else{
+    plot_size<-4
+  } 
+   
+  corplot_in<-microhap_snp %>% 
+    filter(GENID_duplicate %in% filter(phenos, WATER=='LML')$GENID_duplicate,
+           str_detect(locus, 'adaptive'),
+           str_detect(locus, lg_in)) %>% 
+    mutate(locus = str_replace(locus, 'gwas_', '')) %>% 
+    separate(locus, into = c('xx','lg','pos'), sep = '_') %>% 
+    separate(pos, into = c('pos','pos2'), sep = '-pos') %>% 
+    mutate(pos = paste0(as.integer(pos)+as.integer(pos2), '-')) %>% 
+    dplyr::select(GENID_duplicate, pos, AlleIdx_genoty) %>% 
+    arrange(pos) %>% 
+    pivot_wider(names_from = pos, values_from = AlleIdx_genoty) 
+    
+    cor_in<-cor(dplyr::select(corplot_in, -GENID_duplicate), use='pairwise.complete.obs')
+    
+    corplot<-ggcorrplot::ggcorrplot(cor_in, 
+                           lab = TRUE,
+                           show.legend = F,
+                           lab_size = 3,
+                           title = str_replace(lg_in, 'lg', 'Chromosome '))
+    
+    ggsave(paste0('/workdir/smallmouth/gtseq/results/correlation_snps_',lg_in,'.png'), corplot, width = plot_size, height = plot_size)
+}
+```
+  
+### Relatedness
 
 Setup functions
 ```{r, warning=F, message=F, error=F, echo=F}
@@ -1607,7 +1734,7 @@ read_csv('/workdir/smallmouth/gtseq/results/PO_potential.csv') %>%
 
 ```
 
-## consolidate a bunch of pop gen metrics
+### consolidate a bunch of pop gen metrics
 
 Run Ar, Ho, He, HWE, relats, ect, in order to export a figure (2) of pop gen metrics through time
 According to Anderson Waples 2017, I should only exclude FSP for Ne and genetic structure, not for He/Ho/Ar/Fst, ect
@@ -1679,8 +1806,7 @@ annual_fst_test<-
       labs(x = '', y = 'Heterozygosity') +
       xlim(xlims) +
       theme(axis.title.x=element_blank(),
-            axis.text.x = element_blank()) +
-      ggtitle("A")
+            axis.text.x = element_blank())
 
     # Fst
       obj_genepop<-annual_fst_subset %>% 
@@ -1716,8 +1842,7 @@ annual_fst_test<-
         xlim(xlims) +
         geom_vline(xintercept = 2000.5, lty='dashed')  +      
         theme(axis.title.x=element_blank(),
-              axis.text.x = element_blank()) +
-        ggtitle("D")
+              axis.text.x = element_blank())
 
     # Ne
       # group fish into bins of three years, then exclude nests (will increase Ne estimate)
@@ -1792,7 +1917,7 @@ annual_fst_test<-
                                      param_file = paste0(wd,"Ne_params_smb.txt"), 
                                      NE_out_file = paste0(wd,"Ne_out_smb.txt"), 
                                      matingsystem = 0, 
-                                     crit_vals = 0.05)
+                                     crit_vals = 0.01)
       
       RLDNe::run_LDNe(LDNe_params = param_files$param_file)
 
@@ -1820,14 +1945,13 @@ annual_fst_test<-
         geom_point() + 
         geom_line() + 
         geom_ribbon(aes(ymin = low, ymax = high), alpha = 0.2) + 
-        #scale_y_log10() + 
+        scale_y_log10() + 
         theme_cowplot() + 
         labs(x='', y = 'Effective population\nsize') + 
         geom_vline(xintercept = 2000.5, lty='dashed') +
         xlim(xlims)  +
         theme(axis.title.x=element_blank(),
-              axis.text.x = element_blank()) +
-        ggtitle("B")
+              axis.text.x = element_blank())
 
       
 # Bring in relatedness within cohort, excluding egg samples. just freee-swimming BEF fish
@@ -1894,10 +2018,11 @@ annual_fst_test<-
         geom_line() + 
         geom_ribbon(aes(ymin = lower_ci, ymax = upper_ci), alpha = 0.2) + 
         theme_cowplot() + 
-        labs(x='Year', y='Full-sibling\nproportion in cohort') + 
+        labs(y='Full-sibling\nproportion in cohort') + 
         xlim(xlims) + 
         geom_vline(xintercept = 2000.5, lty='dashed') +
-        ggtitle("E")
+        theme(axis.title.x=element_blank(),
+            axis.text.x = element_blank())
 
 # include overall CPUE
     cp_year<-read_csv('/workdir/smallmouth/gtseq/results/cpue_overall.csv') %>% 
@@ -1906,32 +2031,7 @@ annual_fst_test<-
       geom_smooth(span = .1) +
       xlim(xlims) +
       theme_cowplot() +
-      labs(x = '', y = 'Catch / minute') +
-      theme(axis.title.x=element_blank(),
-            axis.text.x = element_blank()) +
-      ggtitle("C")
-
-# Generate final plot
-    plot_grid(
-      plot_grid(
-        Ho_out + theme(legend.position = "none")
-        , ne_fig
-        , cp_year
-        , Fst_out + theme(legend.position = 'none')
-        , fs_cohort
-        , ncol = 1
-        , align = "v")
-      , plot_grid(
-        get_legend(Ho_out)
-        , ggplot() + theme(panel.background = element_blank())
-        , ggplot() + theme(panel.background = element_blank())
-        , get_legend(Fst_out)
-        , ggplot() + theme(panel.background = element_blank())
-        , ncol =1)
-      , rel_widths = c(10,3)
-      )
-    
-    ggsave('/workdir/smallmouth/chapter_3_exports/fig3.png', height=12, width = 8)
+      labs(x='Year', y = 'Catch / minute')
     
 # Sanity check (to go in the supplement) - do we see systematic bias in # of scoring loci?
     annual_fst_test %>% 
@@ -1950,7 +2050,120 @@ annual_fst_test<-
 ```
 
 
+## Plot figure 2
 
+```{r}
+plot_grid(
+  plot_grid(
+      lcwgs_fst + ggtitle('a') + 
+        scale_y_continuous(labels=function(x) sprintf("%.2f", x)) +
+        ylab('\nZfst 50 kbp window') +
+        xlab('Genomic position')
+      , af_out$`adaptive_lg6_3256886-pos201` + 
+        theme(legend.position = 'none') + 
+        scale_y_continuous(limits = c(0,1),
+                           breaks = seq(0,1, 0.25)) +
+        ylab('Chromosome 6\nallele frequency') +
+        ggtitle('b') +
+        theme(axis.title.x=element_blank(),
+              axis.text.x = element_blank())
+      , af_out$`adaptive_lg7_25601423-pos157` + 
+        theme(legend.position = 'none') + 
+        scale_y_continuous(limits = c(0,1),
+                           breaks = seq(0,1, 0.25)) +
+        ylab('Chromosome 7\nallele frequency') +
+        ggtitle('c') +
+        theme(axis.title.x=element_blank(),
+              axis.text.x = element_blank())
+      , af_out$`adaptive_lg19_12740897-pos201` + 
+        theme(legend.position = 'none') + 
+        ylab('Chromosome 19\nallele frequency') +
+        scale_y_continuous(limits = c(0,1),
+                           breaks = seq(0,1, 0.25)) +        
+        ggtitle('d') +
+        theme(axis.title.x=element_blank(),
+              axis.text.x = element_blank())
+      , Ho_out + 
+        theme(legend.position = "none") + 
+        scale_y_continuous(limits = c(0.4,0.6),
+                           breaks = seq(0.4,0.6, 0.05)) +         
+        ylab('\nHeterozygosity') +
+        ggtitle('e')
+      , ne_fig + 
+        scale_y_continuous(limits = c(0,35),
+                           labels=function(x) sprintf("%.1f", x)) +
+        ggtitle('f')
+      , Fst_out + 
+        theme(legend.position = 'none')  + 
+        ggtitle('g')
+      , fs_cohort + 
+        scale_y_continuous(labels=function(x) sprintf("%.2f", x)) +
+        ggtitle('h')
+      , cp_year + 
+        ylab('\nCatch / minute') +
+        scale_y_continuous(labels=function(x) sprintf("%.2f", x)) +
+        ggtitle('i')
+      , align = 'v'
+      , ncol = 1
+  )
+  , plot_grid(
+    ggplot() + 
+      theme(panel.background = element_blank())
+    , theme(panel.background = element_blank())
+    , get_legend(af_out$`adaptive_lg7_25601423-pos157` + 
+                   labs(color = 'Panel'))
+    , theme(panel.background = element_blank())
+    , get_legend(Ho_out)
+    , ggplot() + 
+      theme(panel.background = element_blank())
+    , get_legend(Fst_out)
+    , ggplot() + 
+      theme(panel.background = element_blank())
+    , ggplot() + 
+      theme(panel.background = element_blank())
+    , ncol =1)
+  , rel_widths = c(10,3)
+  )
+
+ggsave('/workdir/smallmouth/chapter_3_exports/fig2.png', height=20, width = 10)
+
+```
+
+## Plot figure 3
+
+```{r}
+plot_grid(
+  gsi_out$`adaptive_lg6_3256886-pos201_F` +
+    ylab('Female\ngonadal-somatic index')  +
+    theme(axis.title.x=element_blank(),
+          axis.text.x = element_blank()) +
+    ggtitle('a')
+  , gsi_out$`adaptive_lg6_3256886-pos201_M` +
+    ylab('Male\ngonadal-somatic index') +
+    theme(axis.title.x=element_blank(),
+          axis.text.x = element_blank()) +
+    ggtitle('b')
+  , len_out$`adaptive_lg6_3256886-pos201` +
+    ggtitle('c')
+  , gsi_out$`adaptive_lg19_12740897-pos201_F` +
+    ylab('Female\ngonadal-somatic index') +
+    theme(axis.title=element_blank(),
+          axis.text = element_blank()) +
+    ggtitle('d')
+  , gsi_out$`adaptive_lg19_12740897-pos201_M` +
+    ylab('Male\ngonadal-somatic index') +
+    theme(axis.title=element_blank(),
+          axis.text = element_blank()) +
+    ggtitle('e')
+  , len_out$`adaptive_lg19_12740897-pos201` +
+    ylab('Length (mm)\nof both sexes') +
+    ggtitle('f')
+  , ncol = 2 
+  , byrow = F
+  , align = 'v')
+
+ggsave('/workdir/smallmouth/chapter_3_exports/fig3.png', height=10, width = 10)
+```
 # Supplement
 
 ## Biomass kilo/hour in the spring
@@ -2364,7 +2577,7 @@ L50_out %>%
 ggsave('/workdir/smallmouth/gtseq/results/pmrn_plot.png', height = 4, width = 6)
 ```
 
-## Compare neutral to adaptive AF change through the suppression
+## Compare neutral to adaptive AF change annually through the suppression, and make table of sample sizes
 
 Take the first SNP per microhap
 ```{r}
@@ -2374,18 +2587,32 @@ Take the first SNP per microhap
 # Build dataset
     fst_test<-
       microhap_snp %>% 
-      left_join(dplyr::select(phenos, GENID_duplicate, WATER, year)) %>% 
+      left_join(dplyr::select(phenos, GENID_duplicate, WATER, year_all=year)) %>% 
       filter(WATER == 'LML', (str_detect(locus, 'parentage') | locus %in% loci_selected)) %>% # don't grab the lg7 or sex
       separate(locus, into = c('loc1','pos'), sep = 'pos', remove = F) %>% # grab the first SNP in each locus
       group_by(loc1) %>% 
       filter(pos == min(pos)) %>% 
       ungroup() %>% 
-      mutate(loc_type = if_else(str_detect(locus, 'parentage'), 'parent-',
+      mutate(loc_type = if_else(str_detect(locus, 'parentage'), 'neutral-',
                                 if_else(str_detect(locus, 'lg19'), 'lg19-', 'lg6-')),
              locus = paste0(loc_type,as.integer(as.factor(locus))),
-             year = if_else(between(year, 1995, 2000), 1998, year)) %>% # rename loci to work in genind
-      dplyr::select(locus, GENID_duplicate, genoty, year)
-    
+             year = if_else(between(year_all, 1995, 2000), 1998, year_all))# rename loci to work in genind
+
+# Export sample sizes
+    fst_test %>% 
+      group_by(locus, year_all) %>% 
+      tally() %>% 
+      filter(year_all<2021) %>% 
+      arrange(year_all) %>% 
+      mutate(year_all = paste0('`', str_sub(year_all, 3))) %>% 
+      pivot_wider(names_from = year_all, values_from = n) %>% 
+      replace(is.na(.), 0) %>% 
+      separate(locus, into = c('name','name2'), sep = '-', remove = F) %>% 
+      mutate(name2 = as.integer(name2)) %>% 
+      arrange(name2) %>% 
+      dplyr::select(-contains('name')) %>% 
+      write_csv('/workdir/smallmouth/chapter_3_exports/af_sample_size.csv')
+
 # Calculate annual allele frequency change per locus
     af_out<-tibble()
     for(loc_in in unique(fst_test$locus)){
@@ -2415,7 +2642,7 @@ Take the first SNP per microhap
     }
   
     af_out<-af_out %>% 
-      mutate(loc_name = if_else(str_detect(loc, 'parent'), ' Neutral', 
+      mutate(loc_name = if_else(str_detect(loc, 'neutral'), ' Neutral', 
                                 if_else(str_detect(loc, '19'), 'Chromsome 19','Chromosome 6')),
              neut_af = if_else(loc_name == ' Neutral', af_diff, NA)) 
 
@@ -2471,6 +2698,125 @@ Take the first SNP per microhap
 # For the text, get the quantiles of years that exceed the normal distribution
     pv_out %>% 
       filter(p19<0.1 | p6 < 0.1)
+```
+
+## Neutral vs adaptive AF at the beginning and end of each bottleneck
+
+Compare 1995-2000 vs 2001 and 2007 vs 2013 (because they have the most data). Take the first SNP per microhap
+```{r}
+# decide on how many individuals per year we want
+    min_n<-5
+
+# Build dataset
+    fst_test<-
+      microhap_snp %>% 
+      left_join(dplyr::select(phenos, GENID_duplicate, WATER, year_all=year)) %>% 
+      filter(WATER == 'LML', (str_detect(locus, 'parentage') | locus %in% loci_selected)) %>% # don't grab the lg7 or sex
+      separate(locus, into = c('loc1','pos'), sep = 'pos', remove = F) %>% # grab the first SNP in each locus
+      group_by(loc1) %>% 
+      filter(pos == min(pos)) %>% 
+      ungroup() %>% 
+      mutate(loc_type = if_else(str_detect(locus, 'parentage'), 'neutral-',
+                                if_else(str_detect(locus, 'lg19'), 'lg19-', 'lg6-')),
+             locus = paste0(loc_type,as.integer(as.factor(locus))),
+             year = if_else(between(year_all, 1995, 2000), 1998, year_all))# rename loci to work in genind
+
+# Export sample sizes
+    fst_test %>% 
+      group_by(locus, year_all) %>% 
+      tally() %>% 
+      filter(year_all<2021) %>% 
+      arrange(year_all) %>% 
+      mutate(year_all = paste0('`', str_sub(year_all, 3))) %>% 
+      pivot_wider(names_from = year_all, values_from = n) %>% 
+      replace(is.na(.), 0) %>% 
+      separate(locus, into = c('name','name2'), sep = '-', remove = F) %>% 
+      mutate(name2 = as.integer(name2)) %>% 
+      arrange(name2) %>% 
+      dplyr::select(-contains('name')) %>% 
+      write_csv('/workdir/smallmouth/chapter_3_exports/af_sample_size.csv')
+    
+# Compare 90's (95-2000) to 2001 and 2006-2011
+    af_out<-tibble()
+    for(loc_in in unique(fst_test$locus)){
+      af_temp<-filter(fst_test, locus == loc_in) %>% 
+        group_by(year) %>% 
+        mutate(n = n()) %>% 
+        filter(n>=min_n) %>% 
+        ungroup() %>% 
+        dplyr::select(locus, GENID_duplicate, genoty, year) %>% 
+        pivot_wider(names_from = locus, values_from = genoty) %>% 
+        filter(!is.na(.[[3]])) %>% 
+        separate(loc_in, into = c('a','b')) %>% 
+        pivot_longer(-c(GENID_duplicate, year))
+      
+      af_in<-af_temp %>% 
+        mutate(alidx = if_else(value == unique(af_temp$value)[1], 1, 0)) %>% 
+        group_by(year) %>% 
+        summarise(af = mean(alidx)) %>% 
+        ungroup() %>% 
+        mutate(yeardiff = year - lag(year),
+               af_diff_short_lag = abs(af - lag(af)) / yeardiff,
+               loc = loc_in)
+      
+    # Get the difference between 1998 and 2001 and set to NA if either year doesn't exist
+      change_1998_2001<-abs(filter(af_in, year == 1998)$af - filter(af_in, year == 2001)$af )
+      change_1998_2001<-if(length(change_1998_2001) == 0) NA else change_1998_2001
+
+    # Get the difference between 2007 and 2013 and set to NA if either year doesn't exist
+      change_2007_2013<-abs(filter(af_in, year == 2007)$af - filter(af_in, year == 2013)$af )
+      change_2007_2013<-if(length(change_2007_2013) == 0) NA else change_2007_2013
+      
+      af_out<-af_in %>% 
+        mutate(`1998-2001`=change_1998_2001,
+               `2007-2013`=change_2007_2013) %>% 
+        bind_rows(af_out)
+    }
+    
+  # Plot the results
+    af_out<-af_out %>% 
+      distinct(loc, `1998-2001`, `2007-2013`) %>% 
+      pivot_longer(-loc, values_to = 'af_diff') %>% 
+      filter(!is.na(af_diff)) %>% 
+      mutate(loc_name = if_else(str_detect(loc, 'neutral'), ' Neutral', 
+                                if_else(str_detect(loc, '19'), 'Chromsome 19','Chromosome 6')))
+    
+    af_out  %>% 
+      ggplot(aes(name, af_diff, color = loc_name)) +
+      geom_boxplot() +
+      geom_point(position = position_jitterdodge(jitter.width = 0.05, jitter.height = 0)) +
+      labs(x = 'Bottleneck years', y = 'Absolute allele frequency change', color = '') +
+      theme_cowplot()
+    
+  # Test for statistical signiicance
+    pv_out<-tibble()
+    for(year_grp in unique(af_out$name)){
+      
+      #year_grp<-"2007-2013"
+
+      dist_in<-af_out %>% 
+        filter(name == year_grp)
+      
+      ggplot(dist_in, aes(af_diff))  + geom_histogram() + geom_point(aes(y=1, color = loc_name))
+    
+      # calculate quantiles 
+        chr_19_quantile<-ecdf(filter(dist_in, loc_name == ' Neutral')$af_diff)(filter(dist_in, loc_name == 'Chromsome 19')$af_diff)
+        chr_6_quantile<-ecdf(filter(dist_in, loc_name == ' Neutral')$af_diff)(filter(dist_in, loc_name == 'Chromosome 6')$af_diff)
+
+      # run p-value test
+        pnrom_in<-dist_in %>% 
+        group_by(loc_name) %>% 
+        summarise(mn = mean(sqrt(af_diff)),
+                  sd = sd(sqrt(af_diff)))
+
+        chr_19_pv<-1-pnorm(pnrom_in$mn[3],pnrom_in$mn[1],pnrom_in$sd[1])
+        chr_6_pv<-1-pnorm(pnrom_in$mn[2],pnrom_in$mn[1],pnrom_in$sd[1])
+        
+      # Compile results
+        pv_out<-bind_rows(pv_out, tibble(yr = year_grp, q19 = chr_19_quantile, q6 = chr_6_quantile, p19 = chr_19_pv, p6 = chr_6_pv))
+    }
+    
+    pv_out
 ```
 
 # Misc paper stats
@@ -2623,7 +2969,7 @@ put ... # it would seem that I need to upload them individually. in the future, 
 
 # Scratch pad
 
-Look at the genotypes of bass we've confirmed as parents, do they show different genotype frequency from the rest of the population?
+## Look at the genotypes of bass we've confirmed as parents, do they show different genotype frequency from the rest of the population?
 ```{r}
 read_csv('/workdir/smallmouth/gtseq/results/PO_potential.csv') %>% 
   filter(confirmed == 1) %>% 
@@ -2660,3 +3006,4 @@ allFish %>%
   geom_line() +
   facet_wrap(~sex)
 ```
+
